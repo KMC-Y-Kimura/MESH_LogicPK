@@ -1,0 +1,120 @@
+{
+  "serverBaseUrl": "http://127.0.0.1:3000",
+  "scanTimeoutSec": 10,
+  "reconnectDelaySec": 5,
+  "blocks": [
+    {
+      "role": "goalSensor",
+      "kind": "brightness",
+      "localName": "MESH-100PA1234567",
+      "notifyMode": "always",
+      "rawScale": 1.0,
+      "rawOffset": 0.0
+    },
+    {
+      "role": "redCycleSingle",
+      "kind": "button",
+      "localName": "MESH-100BU1234567",
+      "buttonId": "redCycle",
+      "trigger": "single"
+    },
+    {
+      "role": "redCycleDouble",
+      "kind": "button",
+      "localName": "MESH-100BU1234567",
+      "buttonId": "redCycle",
+      "trigger": "double"
+    },
+    {
+      "role": "redCycleLong",
+      "kind": "button",
+      "localName": "MESH-100BU1234567",
+      "buttonId": "redCycle",
+      "trigger": "long"
+    },
+    {
+      "role": "redConfirmSingle",
+      "kind": "button",
+      "localName": "MESH-100BU2345678",
+      "buttonId": "redConfirm",
+      "trigger": "single"
+    },
+    {
+      "role": "redConfirmDouble",
+      "kind": "button",
+      "localName": "MESH-100BU2345678",
+      "buttonId": "redConfirm",
+      "trigger": "double"
+    },
+    {
+      "role": "redConfirmLong",
+      "kind": "button",
+      "localName": "MESH-100BU2345678",
+      "buttonId": "redConfirm",
+      "trigger": "long"
+    },
+    {
+      "role": "blueCycleSingle",
+      "kind": "button",
+      "localName": "MESH-100BU3456789",
+      "buttonId": "blueCycle",
+      "trigger": "single"
+    },
+    {
+      "role": "blueCycleDouble",
+      "kind": "button",
+      "localName": "MESH-100BU3456789",
+      "buttonId": "blueCycle",
+      "trigger": "double"
+    },
+    {
+      "role": "blueCycleLong",
+      "kind": "button",
+      "localName": "MESH-100BU3456789",
+      "buttonId": "blueCycle",
+      "trigger": "long"
+    },
+    {
+      "role": "blueConfirmSingle",
+      "kind": "button",
+      "localName": "MESH-100BU4567890",
+      "buttonId": "blueConfirm",
+      "trigger": "single"
+    },
+    {
+      "role": "blueConfirmDouble",
+      "kind": "button",
+      "localName": "MESH-100BU4567890",
+      "buttonId": "blueConfirm",
+      "trigger": "double"
+    },
+    {
+      "role": "blueConfirmLong",
+      "kind": "button",
+      "localName": "MESH-100BU4567890",
+      "buttonId": "blueConfirm",
+      "trigger": "long"
+    },
+    {
+      "role": "refSingle",
+      "kind": "button",
+      "localName": "MESH-100BU5678901",
+      "buttonId": "refereeControl",
+      "trigger": "single"
+    },
+    {
+      "role": "refDouble",
+      "kind": "button",
+      "localName": "MESH-100BU5678901",
+      "buttonId": "refereeControl",
+      "trigger": "double"
+    },
+    {
+      "role": "refLong",
+      "kind": "button",
+      "localName": "MESH-100BU5678901",
+      "buttonId": "refereeControl",
+      "trigger": "long"
+    }
+  ]
+}

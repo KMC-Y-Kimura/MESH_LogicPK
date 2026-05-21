@@ -1,0 +1,55 @@
+{
+  "name": "mesh-ball-toss-system",
+  "version": "1.0.0",
+  "description": "光合成玉入れ - MESH連携判定・表示システム",
+  "type": "module",
+  "main": "dist/server/index.js",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:with-ble": "bash ./scripts/run-dev-with-ble.sh",
+    "dev:server": "tsx watch server/index.ts",
+    "dev:client": "vite --config client/vite.config.ts",
+    "dev:ble": "bash ./scripts/run-ble-bridge.sh",
+    "server:stop": "bash ./scripts/stop-server.sh",
+    "ble:discover": "bash ./scripts/run-ble-bridge.sh --discover",
+    "ble:register": "bash ./scripts/register-mesh-blocks.sh",
+    "ble:check-config": "bash ./scripts/check-mesh-config.sh",
+    "ble:stop": "bash ./scripts/stop-ble-bridge.sh",
+    "match:reset": "bash ./scripts/reset-match.sh",
+    "build": "npm run build:server && npm run build:client",
+    "build:server": "tsc --project server/tsconfig.json",
+    "build:client": "vite build --config client/vite.config.ts",
+    "start:server": "node dist/server/index.js",
+    "start:ble": "bash ./scripts/run-ble-bridge.sh",
+    "preview": "vite preview --config client/vite.config.ts",
+    "type-check": "tsc --noEmit"
+  },
+  "keywords": [
+    "MESH",
+    "IoT",
+    "競技判定",
+    "リアルタイム表示"
+  ],
+  "author": "Kamiyama Marugoto College",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.16.0",
+    "ws": "^8.14.2",
+    "zustand": "^4.4.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.20",
+    "@types/node": "^20.8.0",
+    "@types/react": "^18.2.30",
+    "@types/react-dom": "^18.2.13",
+    "@types/ws": "^8.5.7",
+    "@vitejs/plugin-react": "^4.1.1",
+    "concurrently": "^8.2.2",
+    "typescript": "^5.2.2",
+    "tsx": "^4.1.1",
+    "vite": "^5.0.0"
+  }
+}
