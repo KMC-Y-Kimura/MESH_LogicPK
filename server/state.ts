@@ -1,5 +1,4 @@
 import {
-  BallState,
   BonusChoice,
   ButtonControlsState,
   Calibration,
@@ -21,11 +20,17 @@ import {
   Winner,
   WinnerReason,
 } from "./types";
-import { calculateAverageBasePoints, getExpectedTotalBasePoints } from "./scoring";
+import {
+  calculateAverageBasePoints,
+  DISTANCE_OPTIONS,
+  getExpectedTotalBasePoints,
+} from "./scoring";
 import { defaultCalibration, loadCalibration } from "./config";
 
-const SETUP_DURATION_OPTIONS = [10, 15, 20, 30, 45, 60];
 const THRESHOLD_OPTIONS = [10, 15, 20, 25, 30, 35, 40, 50];
+const FIXED_DRAFT_DURATION_SEC = 300;
+const FIXED_SELECTION_DURATION_SEC = 10;
+const FIXED_ACTIVE_DURATION_SEC = 20;
 
 function otherTeam(team: Team): Team {
   return team === "red" ? "blue" : "red";
@@ -45,43 +50,27 @@ export class MatchStateManager {
 
   private initializeState(): MatchState {
     const calibration = loadCalibration();
-    const baseState: MatchState = {
+
+    return {
       phase: "setup",
-      turnDurationSec: 30,
+      phaseStartedAt: null,
+      draftDurationSec: FIXED_DRAFT_DURATION_SEC,
+      selectionDurationSec: FIXED_SELECTION_DURATION_SEC,
+      activeDurationSec: FIXED_ACTIVE_DURATION_SEC,
       firstThrowingTeam: "red",
-      roundNumber: 1,
+      isOvertime: false,
       teams: {
         red: this.createTeamState("RED", "red", [
-          { name: "R1", basePoints: 0 },
-          { name: "R2", basePoints: 0 },
-          { name: "R3", basePoints: 0 },
+          { name: "R1", basePoints: 3 },
+          { name: "R2", basePoints: 3 },
+          { name: "R3", basePoints: 2 },
         ]),
         blue: this.createTeamState("BLUE", "blue", [
-          { name: "B1", basePoints: 0 },
-          { name: "B2", basePoints: 0 },
-          { name: "B3", basePoints: 0 },
+          { name: "B1", basePoints: 3 },
+          { name: "B2", basePoints: 3 },
+          { name: "B3", basePoints: 2 },
         ]),
       },
-      balls: [
-        {
-          id: "ball-1",
-          name: "ボールA",
-          initialCount: { red: 1, blue: 1 },
-          remaining: { red: 1, blue: 1 },
-        },
-        {
-          id: "ball-2",
-          name: "ボールB",
-          initialCount: { red: 1, blue: 1 },
-          remaining: { red: 1, blue: 1 },
-        },
-        {
-          id: "ball-3",
-          name: "ボールC",
-          initialCount: { red: 1, blue: 1 },
-          remaining: { red: 1, blue: 1 },
-        },
-      ],
       sensor: this.createSensorState(calibration),
       currentTurn: null,
       history: [],
@@ -92,8 +81,6 @@ export class MatchStateManager {
       requiresOvertime: false,
       buttonControls: this.createButtonControls(),
     };
-
-    return baseState;
   }
 
   private createSensorState(calibration: Calibration): GoalSensorState {
@@ -108,8 +95,7 @@ export class MatchStateManager {
 
   private createSetupControlState(): SetupControlState {
     return {
-      focus: "duration",
-      durationOptions: [...SETUP_DURATION_OPTIONS],
+      focus: "firstThrowingTeam",
       thresholdOptions: [...THRESHOLD_OPTIONS],
     };
   }
@@ -119,8 +105,7 @@ export class MatchStateManager {
       team,
       mode: "idle",
       candidatePlayerId: null,
-      candidateDistanceId: null,
-      candidateBallId: null,
+      candidateDistanceId: DISTANCE_OPTIONS[0] ?? null,
       candidateBonusChoice: null,
     };
   }
@@ -148,25 +133,6 @@ export class MatchStateManager {
     };
   }
 
-  private createTeamState(
-    name: string,
-    team: Team,
-    players: Array<{ name: string; basePoints: number }>
-  ): TeamState {
-    const normalizedPlayers = players.map((player, index) => this.createPlayer(team, index, player));
-    const totalBasePoints = normalizedPlayers.reduce((sum, player) => sum + player.basePoints, 0);
-
-    return {
-      name,
-      players: normalizedPlayers,
-      totalBasePoints,
-      averageBasePoints: calculateAverageBasePoints(totalBasePoints, normalizedPlayers.length),
-      rawScore: 0,
-      fouls: 0,
-      disqualified: false,
-    };
-  }
-
   private createPlayer(
     team: Team,
     index: number,
@@ -180,20 +146,45 @@ export class MatchStateManager {
     };
   }
 
-  private createTurn(turnNumber: number, roundNumber: number, throwingTeam: Team): TurnState {
+  private createTeamState(
+    name: string,
+    team: Team,
+    players: Array<{ name: string; basePoints: number }>
+  ): TeamState {
+    const normalizedPlayers = players.map((player, index) => this.createPlayer(team, index, player));
+    const totalBasePoints = normalizedPlayers.reduce((sum, player) => sum + player.basePoints, 0);
+
     return {
-      roundNumber,
+      name,
+      players: normalizedPlayers,
+      throwOrderPlayerIds: [],
+      totalBasePoints,
+      averageBasePoints: calculateAverageBasePoints(totalBasePoints, normalizedPlayers.length),
+      rawScore: 0,
+      fouls: 0,
+      disqualified: false,
+    };
+  }
+
+  private createTurn(
+    turnNumber: number,
+    isOvertime: boolean,
+    throwingTeam: Team,
+    shooterId: string | null
+  ): TurnState {
+    return {
       turnNumber,
+      isOvertime,
       throwingTeam,
       defendingTeam: otherTeam(throwingTeam),
       selection: {
-        shooterId: null,
+        shooterId,
         distanceId: null,
-        ballId: null,
         bonusChoice: null,
       },
       startedAt: null,
       reviewStartedAt: null,
+      resolvedAt: null,
       sensorTriggeredAt: null,
       outcome: null,
       actualDistanceId: null,
@@ -202,24 +193,6 @@ export class MatchStateManager {
       scoreBreakdown: null,
       notes: null,
     };
-  }
-
-  private getAvailableThrowerIds(team: Team): string[] {
-    return this.state.teams[team].players
-      .filter((player) => !player.hasActedInRound)
-      .map((player) => player.id);
-  }
-
-  private getAvailableBallIds(team: Team): string[] {
-    return this.state.balls.filter((ball) => ball.remaining[team] > 0).map((ball) => ball.id);
-  }
-
-  private getValidDurationCandidate(value: number): number {
-    if (SETUP_DURATION_OPTIONS.includes(value)) {
-      return value;
-    }
-
-    return SETUP_DURATION_OPTIONS[0];
   }
 
   private getValidThresholdCandidate(value: number): number {
@@ -235,11 +208,15 @@ export class MatchStateManager {
   }
 
   setState(partial: Partial<MatchState>): void {
-    this.state = { ...this.state, ...partial };
+    this.state = {
+      ...this.state,
+      ...clone(partial),
+    };
   }
 
-  setPhase(phase: MatchPhase): void {
+  setPhase(phase: MatchPhase, phaseStartedAt: number | null): void {
     this.state.phase = phase;
+    this.state.phaseStartedAt = phaseStartedAt;
   }
 
   setWinner(winner: Winner, reason: WinnerReason): void {
@@ -259,12 +236,8 @@ export class MatchStateManager {
     this.state.finishedAt = timestamp;
   }
 
-  setTurnDurationSec(durationSec: number): void {
-    this.state.turnDurationSec = durationSec;
-  }
-
-  setRoundNumber(roundNumber: number): void {
-    this.state.roundNumber = roundNumber;
+  setIsOvertime(isOvertime: boolean): void {
+    this.state.isOvertime = isOvertime;
   }
 
   setFirstThrowingTeam(team: Team): void {
@@ -275,19 +248,16 @@ export class MatchStateManager {
     const calibration = this.state.sensor.calibration;
     this.state = {
       phase: "setup",
-      turnDurationSec: request.turnDurationSec,
+      phaseStartedAt: null,
+      draftDurationSec: FIXED_DRAFT_DURATION_SEC,
+      selectionDurationSec: FIXED_SELECTION_DURATION_SEC,
+      activeDurationSec: FIXED_ACTIVE_DURATION_SEC,
       firstThrowingTeam: request.firstThrowingTeam,
-      roundNumber: 1,
+      isOvertime: false,
       teams: {
         red: this.createTeamState(request.teams.red.name, "red", request.teams.red.players),
         blue: this.createTeamState(request.teams.blue.name, "blue", request.teams.blue.players),
       },
-      balls: request.balls.map((ball, index) => ({
-        id: `ball-${index + 1}`,
-        name: ball.name,
-        initialCount: clone(ball.initialCount),
-        remaining: clone(ball.initialCount),
-      })),
       sensor: this.createSensorState(calibration),
       currentTurn: null,
       history: [],
@@ -303,6 +273,7 @@ export class MatchStateManager {
 
   resetToSetup(): void {
     this.state.phase = "setup";
+    this.state.phaseStartedAt = null;
     this.state.currentTurn = null;
     this.state.history = [];
     this.state.startedAt = null;
@@ -310,11 +281,11 @@ export class MatchStateManager {
     this.state.winner = null;
     this.state.winnerReason = null;
     this.state.requiresOvertime = false;
-    this.state.roundNumber = 1;
+    this.state.isOvertime = false;
     this.state.sensor.successDetected = false;
     this.state.sensor.lastTriggeredAt = null;
     this.resetScoresAndRoundFlags();
-    this.resetBallsToInitial();
+    this.clearThrowOrders();
     this.resetButtonControlsForSetup();
   }
 
@@ -340,57 +311,10 @@ export class MatchStateManager {
     });
   }
 
-  resetBallsToInitial(): void {
-    this.state.balls = this.state.balls.map((ball) => ({
-      ...ball,
-      remaining: clone(ball.initialCount),
-    }));
-  }
-
-  createInitialTurn(): TurnState {
-    return this.createTurn(1, this.state.roundNumber, this.state.firstThrowingTeam);
-  }
-
-  createTurnFor(throwingTeam: Team, turnNumber: number, roundNumber = this.state.roundNumber): TurnState {
-    return this.createTurn(turnNumber, roundNumber, throwingTeam);
-  }
-
-  createNextTurn(): TurnState {
-    const previousTurn = this.state.currentTurn;
-    const nextTurnNumber = (previousTurn?.turnNumber ?? this.state.history.length) + 1;
-    const nextThrowingTeam = previousTurn ? otherTeam(previousTurn.throwingTeam) : this.state.firstThrowingTeam;
-    return this.createTurn(nextTurnNumber, this.state.roundNumber, nextThrowingTeam);
-  }
-
-  setCurrentTurn(turn: TurnState | null): void {
-    this.state.currentTurn = turn ? clone(turn) : null;
-  }
-
-  updateCurrentTurn(updates: Partial<TurnState>): void {
-    if (!this.state.currentTurn) {
-      return;
-    }
-    this.state.currentTurn = {
-      ...this.state.currentTurn,
-      ...clone(updates),
-    };
-  }
-
-  updateCurrentSelection(updates: Partial<TurnSelection>): void {
-    if (!this.state.currentTurn) {
-      return;
-    }
-    this.state.currentTurn.selection = {
-      ...this.state.currentTurn.selection,
-      ...clone(updates),
-    };
-  }
-
-  appendCurrentTurnToHistory(): void {
-    if (!this.state.currentTurn) {
-      return;
-    }
-    this.state.history.push(clone(this.state.currentTurn));
+  clearThrowOrders(): void {
+    (["red", "blue"] as Team[]).forEach((team) => {
+      this.state.teams[team].throwOrderPlayerIds = [];
+    });
   }
 
   getTeam(team: Team): TeamState {
@@ -432,53 +356,117 @@ export class MatchStateManager {
     this.state.teams[team].disqualified = true;
   }
 
-  getBall(ballId: string): BallState | null {
-    return this.state.balls.find((ball) => ball.id === ballId) ?? null;
+  getDraftOrder(team: Team): string[] {
+    return [...this.state.teams[team].throwOrderPlayerIds];
   }
 
-  consumeBall(team: Team, ballId: string): boolean {
-    const ball = this.getBall(ballId);
-    if (!ball || ball.remaining[team] <= 0) {
+  setDraftOrder(team: Team, playerIds: string[]): void {
+    this.state.teams[team].throwOrderPlayerIds = [...playerIds];
+  }
+
+  appendDraftOrder(team: Team, playerId: string): boolean {
+    const teamState = this.state.teams[team];
+    if (teamState.throwOrderPlayerIds.includes(playerId)) {
       return false;
     }
-
-    this.state.balls = this.state.balls.map((entry) =>
-      entry.id === ballId
-        ? {
-            ...entry,
-            remaining: {
-              ...entry.remaining,
-              [team]: entry.remaining[team] - 1,
-            },
-          }
-        : entry
-    );
+    if (!teamState.players.some((player) => player.id === playerId)) {
+      return false;
+    }
+    teamState.throwOrderPlayerIds = [...teamState.throwOrderPlayerIds, playerId];
     return true;
   }
 
-  adjustBall(team: Team, ballId: string, delta: number): BallState | null {
-    const ball = this.getBall(ballId);
-    if (!ball) {
-      return null;
-    }
-
-    const updated = {
-      ...ball,
-      remaining: {
-        ...ball.remaining,
-        [team]: Math.max(0, ball.remaining[team] + delta),
-      },
-    };
-    this.state.balls = this.state.balls.map((entry) => (entry.id === ballId ? updated : entry));
-    return updated;
+  getRemainingDraftPlayers(team: Team): PlayerState[] {
+    const order = new Set(this.state.teams[team].throwOrderPlayerIds);
+    return this.state.teams[team].players.filter((player) => !order.has(player.id));
   }
 
-  getRemainingBonusRights(recipientTeam: Team, roundNumber = this.state.roundNumber): number {
+  isDraftComplete(): boolean {
+    return (["red", "blue"] as Team[]).every(
+      (team) => this.state.teams[team].throwOrderPlayerIds.length === this.state.teams[team].players.length
+    );
+  }
+
+  autoCompleteDraftOrders(): void {
+    (["red", "blue"] as Team[]).forEach((team) => {
+      const teamState = this.state.teams[team];
+      const used = new Set(teamState.throwOrderPlayerIds);
+      const remaining = teamState.players.filter((player) => !used.has(player.id)).map((player) => player.id);
+      if (remaining.length > 0) {
+        teamState.throwOrderPlayerIds = [...teamState.throwOrderPlayerIds, ...remaining];
+      }
+    });
+  }
+
+  getNextShooterId(team: Team): string | null {
+    const teamState = this.state.teams[team];
+    for (const playerId of teamState.throwOrderPlayerIds) {
+      const player = teamState.players.find((entry) => entry.id === playerId);
+      if (player && !player.hasActedInRound) {
+        return player.id;
+      }
+    }
+
+    return teamState.players.find((player) => !player.hasActedInRound)?.id ?? null;
+  }
+
+  createInitialTurn(): TurnState {
+    return this.createTurn(
+      1,
+      this.state.isOvertime,
+      this.state.firstThrowingTeam,
+      this.getNextShooterId(this.state.firstThrowingTeam)
+    );
+  }
+
+  createTurnFor(throwingTeam: Team, turnNumber: number, isOvertime = this.state.isOvertime): TurnState {
+    return this.createTurn(turnNumber, isOvertime, throwingTeam, this.getNextShooterId(throwingTeam));
+  }
+
+  createNextTurn(): TurnState {
+    const previousTurn = this.state.currentTurn;
+    const nextTurnNumber = (previousTurn?.turnNumber ?? this.state.history.length) + 1;
+    const nextThrowingTeam = previousTurn ? otherTeam(previousTurn.throwingTeam) : this.state.firstThrowingTeam;
+    return this.createTurn(nextTurnNumber, this.state.isOvertime, nextThrowingTeam, this.getNextShooterId(nextThrowingTeam));
+  }
+
+  setCurrentTurn(turn: TurnState | null): void {
+    this.state.currentTurn = turn ? clone(turn) : null;
+  }
+
+  updateCurrentTurn(updates: Partial<TurnState>): void {
+    if (!this.state.currentTurn) {
+      return;
+    }
+    this.state.currentTurn = {
+      ...this.state.currentTurn,
+      ...clone(updates),
+    };
+  }
+
+  updateCurrentSelection(updates: Partial<TurnSelection>): void {
+    if (!this.state.currentTurn) {
+      return;
+    }
+    this.state.currentTurn.selection = {
+      ...this.state.currentTurn.selection,
+      ...clone(updates),
+    };
+  }
+
+  appendCurrentTurnToHistory(): void {
+    if (!this.state.currentTurn) {
+      return;
+    }
+    this.state.history.push(clone(this.state.currentTurn));
+  }
+
+  getRemainingBonusRights(recipientTeam: Team, isOvertime = this.state.isOvertime): number {
     const limit = this.state.teams[recipientTeam].players.length;
     let used = 0;
 
     for (const turn of this.state.history) {
-      if (turn.roundNumber !== roundNumber) {
+      if (turn.isOvertime !== isOvertime) {
         continue;
       }
       if (turn.selection.bonusChoice === "distance" && turn.throwingTeam === recipientTeam) {
@@ -498,10 +486,10 @@ export class MatchStateManager {
     }
 
     const choices: BonusChoice[] = [];
-    if (this.getRemainingBonusRights(turn.throwingTeam, turn.roundNumber) > 0) {
+    if (this.getRemainingBonusRights(turn.throwingTeam, turn.isOvertime) > 0) {
       choices.push("distance");
     }
-    if (this.getRemainingBonusRights(turn.defendingTeam, turn.roundNumber) > 0) {
+    if (this.getRemainingBonusRights(turn.defendingTeam, turn.isOvertime) > 0) {
       choices.push("opponentAverage");
     }
     return choices;
@@ -571,7 +559,7 @@ export class MatchStateManager {
     this.state.buttonControls = {
       setup: {
         ...this.createSetupControlState(),
-        focus: currentSetup?.focus ?? "duration",
+        focus: currentSetup?.focus ?? "firstThrowingTeam",
       },
       team: {
         red: this.createTeamControlState("red"),
@@ -580,6 +568,23 @@ export class MatchStateManager {
       review: this.createReviewControlState(),
       lastInput: this.state.buttonControls.lastInput,
     };
+  }
+
+  prepareDraftControls(): void {
+    (["red", "blue"] as Team[]).forEach((team) => {
+      const remainingPlayers = this.getRemainingDraftPlayers(team);
+      const previousCandidate = this.state.buttonControls.team[team].candidatePlayerId;
+      const nextCandidate =
+        remainingPlayers.find((player) => player.id === previousCandidate)?.id ?? remainingPlayers[0]?.id ?? null;
+
+      this.state.buttonControls.team[team] = {
+        team,
+        mode: remainingPlayers.length === 0 ? "done" : "order",
+        candidatePlayerId: nextCandidate,
+        candidateDistanceId: this.state.buttonControls.team[team].candidateDistanceId ?? DISTANCE_OPTIONS[0] ?? null,
+        candidateBonusChoice: this.state.buttonControls.team[team].candidateBonusChoice ?? null,
+      };
+    });
   }
 
   prepareSelectionControls(): void {
@@ -592,17 +597,6 @@ export class MatchStateManager {
 
     const throwingTeam = turn.throwingTeam;
     const defendingTeam = turn.defendingTeam;
-    const availableThrowers = this.getAvailableThrowerIds(throwingTeam);
-    const availableBalls = this.getAvailableBallIds(defendingTeam);
-
-    const selectedShooter =
-      turn.selection.shooterId && availableThrowers.includes(turn.selection.shooterId)
-        ? turn.selection.shooterId
-        : availableThrowers[0] ?? null;
-    const selectedBall =
-      turn.selection.ballId && availableBalls.includes(turn.selection.ballId)
-        ? turn.selection.ballId
-        : availableBalls[0] ?? null;
     const availableBonusChoices = this.getAvailableBonusChoices(turn);
     const selectedBonusChoice =
       turn.selection.bonusChoice && availableBonusChoices.includes(turn.selection.bonusChoice)
@@ -611,40 +605,28 @@ export class MatchStateManager {
 
     this.state.buttonControls.team[throwingTeam] = {
       team: throwingTeam,
-      mode: turn.selection.shooterId
-        ? turn.selection.distanceId
-          ? "done"
-          : "distance"
-        : "shooter",
-      candidatePlayerId: selectedShooter,
+      mode: turn.selection.distanceId ? "done" : "distance",
+      candidatePlayerId: turn.selection.shooterId,
       candidateDistanceId:
         turn.selection.distanceId ??
         this.state.buttonControls.team[throwingTeam].candidateDistanceId ??
-        "near",
-      candidateBallId: selectedBall,
-      candidateBonusChoice:
-        selectedBonusChoice ??
-        this.state.buttonControls.team[throwingTeam].candidateBonusChoice ??
-        "distance",
+        DISTANCE_OPTIONS[0] ??
+        null,
+      candidateBonusChoice: selectedBonusChoice,
     };
 
     this.state.buttonControls.team[defendingTeam] = {
       team: defendingTeam,
-      mode: turn.selection.ballId
-        ? selectedBonusChoice
-          ? "done"
-          : "bonus"
-        : "ball",
-      candidatePlayerId: selectedShooter,
+      mode: turn.selection.bonusChoice ? "done" : "bonus",
+      candidatePlayerId: turn.selection.shooterId,
       candidateDistanceId:
         turn.selection.distanceId ??
         this.state.buttonControls.team[defendingTeam].candidateDistanceId ??
-        "near",
-      candidateBallId: selectedBall,
+        DISTANCE_OPTIONS[0] ??
+        null,
       candidateBonusChoice:
         selectedBonusChoice ??
         this.state.buttonControls.team[defendingTeam].candidateBonusChoice ??
-        availableBonusChoices[0] ??
         null,
     };
   }
@@ -689,7 +671,6 @@ export class MatchStateManager {
   ensureSetupFocusIsValid(fallback: SetupControlFocus): void {
     const focus = this.state.buttonControls.setup.focus;
     const validFocuses: SetupControlFocus[] = [
-      "duration",
       "firstThrowingTeam",
       "triggerThreshold",
       "autoCalibration",
@@ -702,7 +683,6 @@ export class MatchStateManager {
   }
 
   normalizeSetupCandidates(): void {
-    this.state.turnDurationSec = this.getValidDurationCandidate(this.state.turnDurationSec);
     this.state.sensor.calibration.triggerThreshold = this.getValidThresholdCandidate(
       this.state.sensor.calibration.triggerThreshold
     );

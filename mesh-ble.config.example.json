@@ -1,7 +1,11 @@
 {
   "serverBaseUrl": "http://127.0.0.1:3000",
   "scanTimeoutSec": 10,
+  "scanCooldownSec": 2,
+  "notFoundRetrySec": 2,
   "reconnectDelaySec": 5,
+  "maxConcurrentConnects": 1,
+  "connectSettleDelaySec": 0.75,
   "blocks": [
     {
       "role": "goalSensor",

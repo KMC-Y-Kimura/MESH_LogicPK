@@ -1,18 +1,26 @@
 export type Team = "red" | "blue";
-export type MatchPhase = "setup" | "selection" | "active" | "review" | "finished";
-export type DistanceId = "near" | "middle" | "far";
+export type MatchPhase =
+  | "setup"
+  | "draft"
+  | "selection"
+  | "confirmation"
+  | "active"
+  | "review"
+  | "result"
+  | "finished";
+export type DistanceMeter = number;
+export type DistanceId = DistanceMeter;
 export type BonusChoice = "distance" | "opponentAverage";
 export type TurnOutcome = "success" | "miss" | "invalid";
 export type Winner = Team | "draw" | null;
 export type WinnerReason = "roundedScore" | "rawScore" | "fouls" | "disqualification" | null;
 export type SetupControlFocus =
-  | "duration"
   | "firstThrowingTeam"
   | "triggerThreshold"
   | "autoCalibration"
   | "startMatch"
   | "reset";
-export type TeamControlMode = "idle" | "shooter" | "distance" | "ball" | "bonus" | "done";
+export type TeamControlMode = "idle" | "order" | "distance" | "bonus" | "done";
 export type ReviewControlFocus =
   | "outcome"
   | "actualDistance"
@@ -36,18 +44,12 @@ export interface PlayerState {
 export interface TeamState {
   name: string;
   players: PlayerState[];
+  throwOrderPlayerIds: string[];
   totalBasePoints: number;
   averageBasePoints: number;
   rawScore: number;
   fouls: number;
   disqualified: boolean;
-}
-
-export interface BallState {
-  id: string;
-  name: string;
-  initialCount: Record<Team, number>;
-  remaining: Record<Team, number>;
 }
 
 export interface GoalSensorState {
@@ -60,8 +62,7 @@ export interface GoalSensorState {
 
 export interface TurnSelection {
   shooterId: string | null;
-  distanceId: DistanceId | null;
-  ballId: string | null;
+  distanceId: DistanceMeter | null;
   bonusChoice: BonusChoice | null;
 }
 
@@ -74,16 +75,17 @@ export interface TurnScoreBreakdown {
 }
 
 export interface TurnState {
-  roundNumber: number;
   turnNumber: number;
+  isOvertime: boolean;
   throwingTeam: Team;
   defendingTeam: Team;
   selection: TurnSelection;
   startedAt: number | null;
   reviewStartedAt: number | null;
+  resolvedAt: number | null;
   sensorTriggeredAt: number | null;
   outcome: TurnOutcome | null;
-  actualDistanceId: DistanceId | null;
+  actualDistanceId: DistanceMeter | null;
   foulTeam: Team | null;
   disqualifiedTeam: Team | null;
   scoreBreakdown: TurnScoreBreakdown | null;
@@ -92,7 +94,6 @@ export interface TurnState {
 
 export interface SetupControlState {
   focus: SetupControlFocus;
-  durationOptions: number[];
   thresholdOptions: number[];
 }
 
@@ -100,15 +101,14 @@ export interface TeamControlState {
   team: Team;
   mode: TeamControlMode;
   candidatePlayerId: string | null;
-  candidateDistanceId: DistanceId | null;
-  candidateBallId: string | null;
+  candidateDistanceId: DistanceMeter | null;
   candidateBonusChoice: BonusChoice | null;
 }
 
 export interface ReviewControlState {
   focus: ReviewControlFocus;
   outcome: TurnOutcome;
-  actualDistanceId: DistanceId | null;
+  actualDistanceId: DistanceMeter | null;
   foulTeam: Team | null;
   disqualifiedTeam: Team | null;
   notes: string | null;
@@ -131,11 +131,13 @@ export interface ButtonControlsState {
 
 export interface MatchState {
   phase: MatchPhase;
-  turnDurationSec: number;
+  phaseStartedAt: number | null;
+  draftDurationSec: number;
+  selectionDurationSec: number;
+  activeDurationSec: number;
   firstThrowingTeam: Team;
-  roundNumber: number;
+  isOvertime: boolean;
   teams: Record<Team, TeamState>;
-  balls: BallState[];
   sensor: GoalSensorState;
   currentTurn: TurnState | null;
   history: TurnState[];
@@ -164,23 +166,21 @@ export interface SetupTeamInput {
   players: SetupPlayerInput[];
 }
 
-export interface SetupBallInput {
-  name: string;
-  initialCount: Record<Team, number>;
-}
-
 export interface SetupMatchRequest {
   teams: Record<Team, SetupTeamInput>;
-  balls: SetupBallInput[];
-  turnDurationSec: number;
   firstThrowingTeam: Team;
+}
+
+export interface SetDraftOrderRequest {
+  team: Team;
+  playerIds: string[];
 }
 
 export interface ResolveTurnRequest {
   outcome: TurnOutcome;
   foulTeam?: Team | null;
   disqualifiedTeam?: Team | null;
-  actualDistanceId?: DistanceId | null;
+  actualDistanceId?: DistanceMeter | null;
   notes?: string | null;
 }
 

@@ -1,6 +1,5 @@
 import {
   BonusChoice,
-  DistanceId,
   MatchPhase,
   MatchState,
   ReviewControlFocus,
@@ -10,6 +9,13 @@ import {
   TurnState,
   WinnerReason,
 } from "../types";
+
+export const DISTANCE_MIN_METER = 1;
+export const DISTANCE_MAX_METER = 15;
+export const DISTANCE_OPTIONS = Array.from(
+  { length: DISTANCE_MAX_METER - DISTANCE_MIN_METER + 1 },
+  (_, index) => DISTANCE_MIN_METER + index
+);
 
 export const TEAM_LABELS: Record<Team, string> = {
   red: "RED",
@@ -21,34 +27,30 @@ export const TEAM_ACCENTS: Record<Team, string> = {
   blue: "#4f9cff",
 };
 
-export const DISTANCE_LABELS: Record<DistanceId, string> = {
-  near: "近距離 4m-8m",
-  middle: "中距離 8m-13m",
-  far: "遠距離 13m-15m",
-};
-
 export const BONUS_LABELS: Record<BonusChoice, string> = {
-  distance: "相手側へ距離点",
-  opponentAverage: "自チームへ平均基礎点",
+  distance: "投げる側へ距離点",
+  opponentAverage: "守る側へ平均基礎点",
 };
 
 export const PHASE_LABELS: Record<MatchPhase, string> = {
   setup: "試合準備",
-  selection: "選択中",
+  draft: "投球順決定",
+  selection: "ターン選択",
+  confirmation: "選択確認",
   active: "投球中",
   review: "審判判定中",
+  result: "ターン結果",
   finished: "試合終了",
 };
 
 export const WINNER_REASON_LABELS: Record<Exclude<WinnerReason, null>, string> = {
   roundedScore: "切り上げ後得点",
-  rawScore: "小数点を含む実得点",
+  rawScore: "実得点",
   fouls: "反則数",
   disqualification: "失格",
 };
 
 export const SETUP_FOCUS_LABELS: Record<SetupControlFocus, string> = {
-  duration: "制限時間",
   firstThrowingTeam: "先攻チーム",
   triggerThreshold: "成功判定閾値",
   autoCalibration: "自動キャリブレーション",
@@ -58,10 +60,9 @@ export const SETUP_FOCUS_LABELS: Record<SetupControlFocus, string> = {
 
 export const TEAM_CONTROL_MODE_LABELS: Record<TeamControlMode, string> = {
   idle: "待機",
-  shooter: "投球者選択",
+  order: "投球順選択",
   distance: "距離選択",
-  ball: "ボール選択",
-  bonus: "追加得点の向き選択",
+  bonus: "追加得点権選択",
   done: "確定済み",
 };
 
@@ -72,6 +73,10 @@ export const REVIEW_FOCUS_LABELS: Record<ReviewControlFocus, string> = {
   disqualifiedTeam: "失格",
   confirm: "確定",
 };
+
+export function formatDistanceLabel(distance: number | null): string {
+  return distance === null ? "未設定" : `${distance}m`;
+}
 
 export function formatScore(value: number): string {
   if (Number.isInteger(value)) {
@@ -86,47 +91,33 @@ export function getDisplayScore(rawScore: number): number {
 }
 
 export function getRemainingSeconds(state: MatchState): number | null {
-  const startedAt = state.currentTurn?.startedAt;
-  if (state.phase !== "active" || !startedAt) {
+  if (!state.phaseStartedAt) {
     return null;
   }
 
-  const elapsedMs = Date.now() - startedAt;
-  return Math.max(0, Math.ceil((state.turnDurationSec * 1000 - elapsedMs) / 1000));
+  let durationSec: number | null = null;
+  if (state.phase === "draft") {
+    durationSec = state.draftDurationSec;
+  } else if (state.phase === "selection") {
+    durationSec = state.selectionDurationSec;
+  } else if (state.phase === "active") {
+    durationSec = state.activeDurationSec;
+  }
+
+  if (durationSec === null) {
+    return null;
+  }
+
+  const elapsedMs = Date.now() - state.phaseStartedAt;
+  return Math.max(0, Math.ceil((durationSec * 1000 - elapsedMs) / 1000));
 }
 
 export function findPlayerName(state: MatchState, team: Team, playerId: string | null): string {
   if (!playerId) {
-    return "未選択";
+    return "未設定";
   }
 
   return state.teams[team].players.find((player) => player.id === playerId)?.name ?? "不明";
-}
-
-export function findBallName(state: MatchState, ballId: string | null): string {
-  if (!ballId) {
-    return "未選択";
-  }
-
-  return state.balls.find((ball) => ball.id === ballId)?.name ?? "不明";
-}
-
-export function getTurnSelectionSummary(state: MatchState, turn: TurnState | null) {
-  if (!turn) {
-    return {
-      shooter: "未設定",
-      distance: "未設定",
-      ball: "未設定",
-      bonus: "未設定",
-    };
-  }
-
-  return {
-    shooter: findPlayerName(state, turn.throwingTeam, turn.selection.shooterId),
-    distance: turn.selection.distanceId ? DISTANCE_LABELS[turn.selection.distanceId] : "未設定",
-    ball: findBallName(state, turn.selection.ballId),
-    bonus: turn.selection.bonusChoice ? BONUS_LABELS[turn.selection.bonusChoice] : "未設定",
-  };
 }
 
 export function getWinnerSummary(reason: WinnerReason): string {
@@ -137,12 +128,24 @@ export function getWinnerSummary(reason: WinnerReason): string {
   return WINNER_REASON_LABELS[reason];
 }
 
-export function getRemainingBonusRights(state: MatchState, recipientTeam: Team, roundNumber = state.roundNumber): number {
+export function getPhaseDisplayLabel(state: MatchState): string {
+  if (state.isOvertime && state.phase !== "setup" && state.phase !== "finished") {
+    return `延長戦 / ${PHASE_LABELS[state.phase]}`;
+  }
+
+  return PHASE_LABELS[state.phase];
+}
+
+export function getRemainingBonusRights(
+  state: MatchState,
+  recipientTeam: Team,
+  isOvertime = state.isOvertime
+): number {
   const limit = state.teams[recipientTeam].players.length;
   let used = 0;
 
   for (const turn of state.history) {
-    if (turn.roundNumber !== roundNumber) {
+    if (turn.isOvertime !== isOvertime) {
       continue;
     }
     if (turn.selection.bonusChoice === "distance" && turn.throwingTeam === recipientTeam) {
@@ -154,4 +157,19 @@ export function getRemainingBonusRights(state: MatchState, recipientTeam: Team, 
   }
 
   return Math.max(0, limit - used);
+}
+
+export function getBonusRecipientTeam(turn: TurnState, choice: BonusChoice): Team {
+  return choice === "distance" ? turn.throwingTeam : turn.defendingTeam;
+}
+
+export function getBonusUsageTeam(turn: TurnState, choice: BonusChoice): Team {
+  return choice === "distance" ? turn.throwingTeam : turn.defendingTeam;
+}
+
+export function getBonusChoiceLabelForTurn(state: MatchState, turn: TurnState, choice: BonusChoice): string {
+  const recipientTeam = getBonusRecipientTeam(turn, choice);
+  return choice === "distance"
+    ? `${state.teams[recipientTeam].name} に距離点`
+    : `${state.teams[recipientTeam].name} に平均基礎点`;
 }

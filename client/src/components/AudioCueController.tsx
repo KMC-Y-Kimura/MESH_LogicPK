@@ -17,7 +17,7 @@ export function AudioCueController() {
   const previousPhaseRef = useRef<string | null>(null);
   const warningPlayedTurnRef = useRef<number | null>(null);
 
-  const isOperatorPage = location.pathname === "/";
+  const isOperatorPage = location.pathname === "/team/red" || location.pathname === "/";
 
   useEffect(() => {
     const audioMap = {
@@ -99,7 +99,7 @@ export function AudioCueController() {
       !state ||
       state.phase !== "active" ||
       !state.currentTurn?.startedAt ||
-      state.turnDurationSec <= 30
+      state.activeDurationSec <= 30
     ) {
       return;
     }
@@ -110,7 +110,7 @@ export function AudioCueController() {
     }
 
     const intervalId = window.setInterval(() => {
-      const remainingMs = state.turnDurationSec * 1000 - (Date.now() - turnId);
+      const remainingMs = state.activeDurationSec * 1000 - (Date.now() - turnId);
       const remainingSec = Math.ceil(remainingMs / 1000);
 
       if (remainingSec <= 30 && warningPlayedTurnRef.current !== turnId) {
@@ -122,7 +122,7 @@ export function AudioCueController() {
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [isOperatorPage, state?.phase, state?.turnDurationSec, state?.currentTurn?.startedAt]);
+  }, [isOperatorPage, state?.phase, state?.activeDurationSec, state?.currentTurn?.startedAt]);
 
   return null;
 }

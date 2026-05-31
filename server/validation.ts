@@ -1,22 +1,25 @@
 import {
-  AdjustBallRequest,
   AdjustFoulRequest,
   BonusChoice,
   CalibrationRequest,
-  DistanceId,
   MeshButtonRequest,
   ResolveTurnRequest,
-  SelectBallRequest,
   SelectBonusRequest,
   SelectDistanceRequest,
-  SelectShooterRequest,
   SensorValueRequest,
+  SetDraftOrderRequest,
   SetupMatchRequest,
   StartMatchRequest,
   StartOvertimeRequest,
   Team,
   TurnOutcome,
 } from "./types";
+import {
+  DISTANCE_MAX_METER,
+  DISTANCE_MIN_METER,
+  getExpectedTotalBasePoints,
+  isValidDistanceMeter,
+} from "./scoring";
 
 interface ValidationError {
   valid: false;
@@ -30,7 +33,6 @@ interface ValidationSuccess {
 type ValidationResult = ValidationError | ValidationSuccess;
 
 const VALID_TEAMS: Team[] = ["red", "blue"];
-const VALID_DISTANCES: DistanceId[] = ["near", "middle", "far"];
 const VALID_BONUS_CHOICES: BonusChoice[] = ["distance", "opponentAverage"];
 const VALID_OUTCOMES: TurnOutcome[] = ["success", "miss", "invalid"];
 
@@ -45,12 +47,6 @@ export function validateSetupMatch(body: unknown): ValidationResult {
 
   if (!VALID_TEAMS.includes(req.firstThrowingTeam)) {
     errors.push(`firstThrowingTeam must be one of: ${VALID_TEAMS.join(", ")}`);
-  }
-
-  if (typeof req.turnDurationSec !== "number" || Number.isNaN(req.turnDurationSec)) {
-    errors.push("turnDurationSec must be a valid number");
-  } else if (req.turnDurationSec <= 0 || req.turnDurationSec > 60) {
-    errors.push("turnDurationSec must be between 1 and 60");
   }
 
   for (const team of VALID_TEAMS) {
@@ -69,16 +65,32 @@ export function validateSetupMatch(body: unknown): ValidationResult {
       continue;
     }
 
+    let totalBasePoints = 0;
+    let hasInvalidBasePoints = false;
+
     teamConfig.players.forEach((player, index) => {
       if (typeof player.name !== "string" || player.name.trim() === "") {
         errors.push(`${team} player ${index + 1} name is required`);
       }
       if (typeof player.basePoints !== "number" || Number.isNaN(player.basePoints)) {
         errors.push(`${team} player ${index + 1} basePoints must be a valid number`);
-      } else if (player.basePoints < 0) {
-        errors.push(`${team} player ${index + 1} basePoints must be >= 0`);
+        hasInvalidBasePoints = true;
+      } else if (!Number.isInteger(player.basePoints) || player.basePoints < 1) {
+        errors.push(`${team} player ${index + 1} basePoints must be an integer >= 1`);
+        hasInvalidBasePoints = true;
+      } else {
+        totalBasePoints += player.basePoints;
       }
     });
+
+    if (!hasInvalidBasePoints) {
+      const expectedTotalBasePoints = getExpectedTotalBasePoints(teamConfig.players.length);
+      if (totalBasePoints !== expectedTotalBasePoints) {
+        errors.push(
+          `${team} team total basePoints must equal ${expectedTotalBasePoints} (current ${totalBasePoints})`
+        );
+      }
+    }
   }
 
   const redCount = req.teams?.red?.players?.length ?? -1;
@@ -87,27 +99,26 @@ export function validateSetupMatch(body: unknown): ValidationResult {
     errors.push("red and blue teams must have the same number of players");
   }
 
-  if (!Array.isArray(req.balls) || req.balls.length < 3) {
-    errors.push("balls must contain at least 3 entries");
-  } else {
-    req.balls.forEach((ball, index) => {
-      if (typeof ball.name !== "string" || ball.name.trim() === "") {
-        errors.push(`ball ${index + 1} name is required`);
-      }
-      if (!ball.initialCount || typeof ball.initialCount !== "object") {
-        errors.push(`ball ${index + 1} initialCount is required`);
-        return;
-      }
+  return errors.length > 0 ? { valid: false, errors } : { valid: true };
+}
 
-      for (const team of VALID_TEAMS) {
-        const value = ball.initialCount[team];
-        if (typeof value !== "number" || Number.isNaN(value)) {
-          errors.push(`ball ${index + 1} ${team} initialCount must be a valid number`);
-        } else if (!Number.isInteger(value) || value < 1 || value > 2) {
-          errors.push(`ball ${index + 1} ${team} initialCount must be 1 or 2`);
-        }
-      }
-    });
+export function validateSetDraftOrder(body: unknown): ValidationResult {
+  const errors: string[] = [];
+
+  if (!body || typeof body !== "object") {
+    return { valid: false, errors: ["Request body must be an object"] };
+  }
+
+  const req = body as SetDraftOrderRequest;
+
+  if (!VALID_TEAMS.includes(req.team)) {
+    errors.push(`team must be one of: ${VALID_TEAMS.join(", ")}`);
+  }
+
+  if (!Array.isArray(req.playerIds)) {
+    errors.push("playerIds must be an array");
+  } else if (!req.playerIds.every((value) => typeof value === "string" && value.trim() !== "")) {
+    errors.push("playerIds must contain non-empty strings");
   }
 
   return errors.length > 0 ? { valid: false, errors } : { valid: true };
@@ -152,19 +163,6 @@ export function validateMeshButton(body: unknown): ValidationResult {
   return errors.length > 0 ? { valid: false, errors } : { valid: true };
 }
 
-export function validateSelectShooter(body: unknown): ValidationResult {
-  const errors: string[] = [];
-  const req = body as SelectShooterRequest;
-
-  if (!body || typeof body !== "object") {
-    return { valid: false, errors: ["Request body must be an object"] };
-  }
-  if (typeof req.playerId !== "string" || req.playerId.trim() === "") {
-    errors.push("playerId is required");
-  }
-  return errors.length > 0 ? { valid: false, errors } : { valid: true };
-}
-
 export function validateSelectDistance(body: unknown): ValidationResult {
   const errors: string[] = [];
   const req = body as SelectDistanceRequest;
@@ -172,21 +170,8 @@ export function validateSelectDistance(body: unknown): ValidationResult {
   if (!body || typeof body !== "object") {
     return { valid: false, errors: ["Request body must be an object"] };
   }
-  if (!VALID_DISTANCES.includes(req.distanceId)) {
-    errors.push(`distanceId must be one of: ${VALID_DISTANCES.join(", ")}`);
-  }
-  return errors.length > 0 ? { valid: false, errors } : { valid: true };
-}
-
-export function validateSelectBall(body: unknown): ValidationResult {
-  const errors: string[] = [];
-  const req = body as SelectBallRequest;
-
-  if (!body || typeof body !== "object") {
-    return { valid: false, errors: ["Request body must be an object"] };
-  }
-  if (typeof req.ballId !== "string" || req.ballId.trim() === "") {
-    errors.push("ballId is required");
+  if (!isValidDistanceMeter(req.distanceId)) {
+    errors.push(`distanceId must be an integer between ${DISTANCE_MIN_METER} and ${DISTANCE_MAX_METER}`);
   }
   return errors.length > 0 ? { valid: false, errors } : { valid: true };
 }
@@ -227,9 +212,11 @@ export function validateResolveTurn(body: unknown): ValidationResult {
   if (
     req.actualDistanceId !== undefined &&
     req.actualDistanceId !== null &&
-    !VALID_DISTANCES.includes(req.actualDistanceId)
+    !isValidDistanceMeter(req.actualDistanceId)
   ) {
-    errors.push(`actualDistanceId must be one of: ${VALID_DISTANCES.join(", ")}`);
+    errors.push(
+      `actualDistanceId must be an integer between ${DISTANCE_MIN_METER} and ${DISTANCE_MAX_METER}`
+    );
   }
   if (req.notes !== undefined && req.notes !== null && typeof req.notes !== "string") {
     errors.push("notes must be a string if provided");
@@ -246,25 +233,6 @@ export function validateAdjustFoul(body: unknown): ValidationResult {
   }
   if (!VALID_TEAMS.includes(req.team)) {
     errors.push(`team must be one of: ${VALID_TEAMS.join(", ")}`);
-  }
-  if (typeof req.delta !== "number" || ![-1, 1].includes(req.delta)) {
-    errors.push("delta must be 1 or -1");
-  }
-  return errors.length > 0 ? { valid: false, errors } : { valid: true };
-}
-
-export function validateAdjustBall(body: unknown): ValidationResult {
-  const errors: string[] = [];
-  const req = body as AdjustBallRequest;
-
-  if (!body || typeof body !== "object") {
-    return { valid: false, errors: ["Request body must be an object"] };
-  }
-  if (!VALID_TEAMS.includes(req.team)) {
-    errors.push(`team must be one of: ${VALID_TEAMS.join(", ")}`);
-  }
-  if (typeof req.ballId !== "string" || req.ballId.trim() === "") {
-    errors.push("ballId is required");
   }
   if (typeof req.delta !== "number" || ![-1, 1].includes(req.delta)) {
     errors.push("delta must be 1 or -1");
@@ -293,39 +261,37 @@ export function validateCalibration(body: unknown): ValidationResult {
   if (
     typeof req.minRaw === "number" &&
     typeof req.emptyRaw === "number" &&
-    req.minRaw === req.emptyRaw
+    req.emptyRaw < req.minRaw
   ) {
-    errors.push("minRaw and emptyRaw must be different");
+    errors.push("emptyRaw must be greater than or equal to minRaw");
   }
   return errors.length > 0 ? { valid: false, errors } : { valid: true };
 }
 
 export function validateStartMatch(body: unknown): ValidationResult {
-  const errors: string[] = [];
-  if (body === undefined || body === null) {
-    return { valid: true };
-  }
-  if (typeof body !== "object") {
+  if (!body || typeof body !== "object") {
     return { valid: false, errors: ["Request body must be an object"] };
   }
+  const errors: string[] = [];
   const req = body as StartMatchRequest;
+
   if (req.firstThrowingTeam !== undefined && !VALID_TEAMS.includes(req.firstThrowingTeam)) {
     errors.push(`firstThrowingTeam must be one of: ${VALID_TEAMS.join(", ")}`);
   }
+
   return errors.length > 0 ? { valid: false, errors } : { valid: true };
 }
 
 export function validateStartOvertime(body: unknown): ValidationResult {
-  const errors: string[] = [];
-  if (body === undefined || body === null) {
-    return { valid: true };
-  }
-  if (typeof body !== "object") {
+  if (!body || typeof body !== "object") {
     return { valid: false, errors: ["Request body must be an object"] };
   }
+  const errors: string[] = [];
   const req = body as StartOvertimeRequest;
+
   if (req.firstThrowingTeam !== undefined && !VALID_TEAMS.includes(req.firstThrowingTeam)) {
     errors.push(`firstThrowingTeam must be one of: ${VALID_TEAMS.join(", ")}`);
   }
+
   return errors.length > 0 ? { valid: false, errors } : { valid: true };
 }

@@ -1,171 +1,244 @@
-# Logic PK - 判定・選択・表示システム
+# MESH_MAIN
 
-## 概要
+MESH ブロックを BLE 直結で使う、Logic PK 用の競技進行・判定システムです。  
+MESH アプリは必須ではありません。RED 画面、BLUE 画面、スマホ用スコア画面の 3 系統で運用します。
 
-このリポジトリは、競技「Logic PK」向けのローカル運用システムです。
+## 画面
 
-現在の標準運用は次です。
+- RED 画面
+  - setup 中は管理画面
+  - 試合開始後は RED チーム画面
+- BLUE 画面
+  - setup 中は待機表示
+  - 試合開始後は BLUE チーム画面
+- スマホ用スコア
+  - 現在スコアだけを誰でも見られる公開画面
 
-- MESH 明るさブロック 1 個をゴール成功判定センサーとして使う
-- RED 用 2 ボタン、BLUE 用 2 ボタン、審判用 1 ボタンを使う
-- Mac は RED 画面、モニター1 は BLUE 画面、モニター2 は全体画面として使う
+開く URL:
 
-重要:
+- RED: `http://localhost:5173/team/red`
+- BLUE: `http://localhost:5173/team/blue`
+- SCORE: `http://localhost:5173/score`
 
-- 試合前の設定編集は RED 画面だけで行います
-- BLUE 画面と全体画面は、setup 中でも初期設定の閲覧画面を表示します
-- プレイヤー用ボタンは、単押し・ダブルクリック・長押しを区別しません
-- `mesh-ble.config.json` が旧版のままならボタンは動きません。更新後は `npm run ble:register` を一度実行してください
+スマートフォンからは `localhost` ではなく、Vite 起動時に出る `Network` URL に `/score` を付けて開いてください。
 
-## 正として見る文書
+## 必要な MESH ブロック
 
-- [README.md](README.md)
-- [SPEC.md](SPEC.md)
-- [OPERATION_MANUAL.md](OPERATION_MANUAL.md)
-- [MESH_BLE_DIRECT.md](MESH_BLE_DIRECT.md)
-- [MESH_BLOCK_REGISTRATION.md](MESH_BLOCK_REGISTRATION.md)
+- 明るさセンサー 1 個
+- RED 用ボタン 2 個
+- BLUE 用ボタン 2 個
+- 審判用ボタン 1 個
 
-## 画面構成
+BLE 上の論理 role は次の 6 つです。
 
-- `/team/red`
-  - setup 中: RED の設定編集画面
-  - 試合開始後: RED チーム画面
-- `/team/blue`
-  - setup 中: BLUE 用の準備確認画面
-  - 試合開始後: BLUE チーム画面
-- `/`
-  - setup 中: 全体モニター用の準備確認画面
-  - 試合開始後: メイン画面
-  - 試合終了後: 結果もこの画面に表示
-
-## ボタン構成
-
-論理上のボタン役割は 5 つです。現在の Logic PK 実装では、各論理ボタンに別々の物理 MESH ボタンが必要です。
-
+- `goalSensor`
 - `redCycle`
-  - RED の候補送り
 - `redConfirm`
-  - RED の確定 / やり直し
 - `blueCycle`
-  - BLUE の候補送り
 - `blueConfirm`
-  - BLUE の確定 / やり直し
 - `refereeControl`
-  - 審判操作
 
-同じ物理ボタンを `redCycle` と `blueCycle` のように複数の論理ボタンへ共有すると、1 回の押下で複数コマンドが同時に飛び、選択フェーズが壊れます。`redCycle`, `redConfirm`, `blueCycle`, `blueConfirm`, `refereeControl` は必ず別々の MESH ボタンへ割り当ててください。
+各チームボタンは押し方の違いを見ません。単押し・ダブルクリック・長押しのどれでも同じ役割です。
 
-### RED / BLUE ボタン
+- `Cycle`: 候補送り
+- `Confirm`: 確定
 
-- ボタン1: 次候補へ進める
-- ボタン2: 現在候補を確定する
-- どの押し方でも同じ動作です
+審判ボタンだけは押し方を使い分けます。
 
-投げる側は `投球者 -> 距離` の順で進みます。守る側は `ボール -> 追加得点の向き` の順で進みます。追加得点の向きは選べますが、そのラウンド内で残り権利が 0 の向きは選べません。
+- 単押し: レビュー項目移動
+- ダブルクリック: レビュー項目の値変更 / 投球中は詳細判定へ移行
+- 長押し: 次のステージへ進む、または確定
 
-表示制限:
+## 競技ルール
 
-- 両チームがそのターンの全項目を決めきるまでは、相手チームが決めている内容は相互に非表示です
-- 全体画面 `/` でも、両チームの選択がそろうまではターン詳細を公開しません
-- 追加得点の向きは、両チームの選択がそろった後も、成功 / 失敗 / 無効の結果が確定するまで非表示です
+### 試合前
 
-### 審判ボタン
+- 各チームの人数は同じでなければならない
+- 各選手の基礎点は整数 `1` 以上
+- 各チームの基礎点合計は `ceil(人数 × 2.5)`
+- setup 後、各チームは `5 分` で投球順を決める
 
-試合前と試合後:
+### 1 ターンの流れ
 
-- 単押し: 次の項目へ
-- ダブルクリック: 前の項目へ
-- 長押し: 現在項目を実行
+1. 投げる側は距離を選ぶ
+   - `1m` 単位
+   - 選択時間 `10 秒`
+2. 投げない側は追加得点権を選ぶ
+   - 選択時間 `10 秒`
+3. 審判長押しで選択確認
+4. 審判長押しでもう一度進めると投球開始
+5. 投球時間は `20 秒`
+6. 投球後は結果画面を出す
+   - どちらの権利を使ったか
+   - 今回の加点
+   - 反則 / 失格
+7. 審判長押しで次のターンへ進む
 
-試合中:
+### 距離点
 
-- 選択フェーズ: 長押しでターン開始
-- 投球フェーズ: 長押しでレビューへ
-- レビューフェーズ
-  - 単押し: 判定項目移動
-  - ダブルクリック: 現在項目の値変更
-  - 長押し: `confirm` 上で結果確定
+- 成功時、投球者の基礎点が入る
+- `距離点権` を使った場合、その距離 `m` がそのまま加点される
 
-## 自動キャリブレーション
+### 追加得点権
 
-現在の標準は自動キャリブレーションです。
+各チームは、自チーム人数ぶんだけ自分の権利を持ちます。  
+権利が `0` になった向きは選べません。
 
-- `minRaw` は常に `0`
-- `emptyRaw` は現在のセンサー値
-- `triggerThreshold` は現在設定値を維持
+- `distance`
+  - 投げる側が自分の距離点権を使う
+  - 投げる側に距離点が入る
+- `opponentAverage`
+  - 投げない側が自分の平均基礎点権を使う
+  - 投げない側に平均基礎点が入る
 
-つまり、「空ゴール時の値だけを取り直す」構成です。
+### 成功・失敗・無効
 
-## 起動
+- 成功
+  - センサーが閾値以下になった
+- 失敗
+  - 投球時間内に成功検知しなかった
+- 無効
+  - 審判レビューで無効判定にした
+
+### 反則・失格
+
+- 審判がレビュー画面で付与する
+- 勝敗判定順
+  1. 失格の有無
+  2. 切り上げ後得点
+  3. 実得点
+  4. 反則数
+
+### 延長戦
+
+- 同点なら延長戦
+- 結果画面で審判長押しすると延長戦を開始できる
+- 選手の投球済みフラグだけをリセットし、同じ投球順を再利用する
+
+## MESH 接続手順
+
+初回またはブロックを入れ替えたとき:
 
 ```bash
-npm install
 npm run ble:stop
+npm run ble:discover
 npm run ble:register
+npm run ble:check-config
+```
+
+通常起動:
+
+```bash
 npm run dev:with-ble
 ```
 
-Web UI だけなら:
+よく使う補助コマンド:
+
+```bash
+npm run ble:stop
+npm run server:stop
+npm run match:reset
+```
+
+## BLE 登録の考え方
+
+`npm run ble:register` では、近くの MESH ブロックをスキャンして role を割り当てます。
+
+推奨対応:
+
+- `goalSensor` -> 明るさセンサー
+- `redCycle` -> RED ボタン1
+- `redConfirm` -> RED ボタン2
+- `blueCycle` -> BLUE ボタン1
+- `blueConfirm` -> BLUE ボタン2
+- `refereeControl` -> 審判ボタン
+
+`npm run ble:check-config` で role の欠けがないことを確認してください。
+
+## センサー設定
+
+- `minRaw` は `0` 固定で運用可能
+- `emptyRaw` は空ゴール時の値
+- `triggerThreshold` 以下で成功判定
+
+setup 画面から次ができます。
+
+- 自動キャリブレーション
+- `minRaw = 0` 固定
+- 現在値を空ゴール値として保存
+- 手動保存
+
+## 実行コマンド
+
+```bash
+npm install
+npm run dev:with-ble
+```
+
+BLE を使わず画面だけ確認する場合:
 
 ```bash
 npm run dev
 ```
 
-## リセットと停止
-
-試合結果だけを消して setup に戻したい場合:
+型チェック:
 
 ```bash
-npm run match:reset
+npm run type-check
 ```
 
-Node サーバを完全に止めたい場合:
+ビルド:
+
+```bash
+npm run build
+```
+
+## トラブルシュート
+
+### `no MESH blocks found`
+
+まず既存ブリッジを止めてから再探索してください。
+
+```bash
+npm run ble:stop
+npm run ble:discover
+```
+
+それでも出ない場合:
+
+- MESH アプリや他端末が接続中でないか確認
+- ブロックの電源を入れ直す
+- Mac の Bluetooth 権限を確認
+
+### `mesh-ble.config.json が旧構成です`
+
+role が足りていません。再登録してください。
+
+```bash
+npm run ble:register
+npm run ble:check-config
+```
+
+### `Port 3000 is already in use`
+
+既存サーバを再利用しているだけなら即問題ではありません。  
+完全に止めたい場合:
 
 ```bash
 npm run server:stop
 ```
 
-注意:
+### スコアだけ消したい
 
-- `npm run dev:with-ble` は `3000` 番の既存サーバを再利用することがあります
-- そのため、`Ctrl+C` したつもりでも別のサーバプロセスが残っていると、状態は残って見えます
-- 永続化しているのは `calibration.json` のキャリブレーション値だけで、試合結果そのものはメモリ上です
+```bash
+npm run match:reset
+```
 
-## 実運用の画面割り当て
+## 現在残している主要ファイル
 
-- Mac: `http://localhost:5173/team/red`
-- モニター1: `http://localhost:5173/team/blue`
-- モニター2: `http://localhost:5173/`
-
-Vite のポートが `5173` 以外へずれた場合は、その起動ログの URL を使ってください。
-
-## BLE 構成
-
-標準構成は 6 ブロックです。
-
-- 明るさブロック 1 個
-  - `goalSensor`
-- RED ボタン 2 個
-  - `redCycle`
-  - `redConfirm`
-- BLUE ボタン 2 個
-  - `blueCycle`
-  - `blueConfirm`
-- 審判ボタン 1 個
-  - `refereeControl`
-
-設定テンプレートは [mesh-ble.config.example.json](mesh-ble.config.example.json) です。
-
-## 現在の前提と制限
-
-- 単一ゴール、明るさセンサー 1 本前提です
-- 成功検知はセンサーで行いますが、得点確定は審判レビュー後です
-- 試合中の操作はボタンで完結できます
-- チーム名、選手名、基礎点、ボールのチーム別利用権の編集は RED setup 画面で行います
-
-## 最初に見る文書
-
-- 実運用手順: [OPERATION_MANUAL.md](OPERATION_MANUAL.md)
-- BLE 接続: [MESH_BLE_DIRECT.md](MESH_BLE_DIRECT.md)
-- ブロック差し替え: [MESH_BLOCK_REGISTRATION.md](MESH_BLOCK_REGISTRATION.md)
-- 仕様詳細: [SPEC.md](SPEC.md)
+- `server/`: API と試合ロジック
+- `client/`: RED / BLUE / SCORE 画面
+- `scripts/`: 起動・BLE 補助スクリプト
+- `mesh-ble.config.example.json`: BLE 設定例
+- `mesh-ble.config.json`: 現在使う BLE 設定
+- `calibration.json`: センサー校正値

@@ -26,9 +26,6 @@ BRIGHTNESS_NOTIFY_MODE = {
     "brightness_change_and_always": 0x28,
 }
 
-SCAN_LOCK = asyncio.Lock()
-
-
 def log(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[mesh-ble {timestamp}] {message}", flush=True)
@@ -95,21 +92,74 @@ async def discover_mesh_blocks(timeout: float) -> int:
     return 0
 
 
-async def find_device(local_name: str, timeout: float):
-    async with SCAN_LOCK:
-        log(f"Scanning for {local_name} ...")
-        return await BleakScanner.find_device_by_filter(
-            lambda device, advertisement_data: (
-                (advertisement_data.local_name or device.name or "") == local_name
-            ),
-            timeout=timeout,
-        )
+class MeshDiscoveryRegistry:
+    def __init__(self, scan_timeout: float, scan_cooldown: float):
+        self.scan_timeout = scan_timeout
+        self.scan_cooldown = scan_cooldown
+        self._scan_lock = asyncio.Lock()
+        self._devices_by_name: dict[str, Any] = {}
+        self._last_scan_monotonic = 0.0
+
+    async def get_device(self, local_name: str) -> Any | None:
+        devices = await self._discover(force=False)
+        device = devices.get(local_name)
+        if device is not None:
+            return device
+        devices = await self._discover(force=True)
+        return devices.get(local_name)
+
+    def invalidate(self, local_name: str) -> None:
+        self._devices_by_name.pop(local_name, None)
+
+    async def _discover(self, force: bool) -> dict[str, Any]:
+        now = time.monotonic()
+        if (
+            not force
+            and self._devices_by_name
+            and now - self._last_scan_monotonic < self.scan_cooldown
+        ):
+            return self._devices_by_name
+
+        async with self._scan_lock:
+            now = time.monotonic()
+            if (
+                not force
+                and self._devices_by_name
+                and now - self._last_scan_monotonic < self.scan_cooldown
+            ):
+                return self._devices_by_name
+
+            log(f"Discovery sweep started ({self.scan_timeout:.1f}s)")
+            devices = await BleakScanner.discover(timeout=self.scan_timeout)
+            visible_devices: dict[str, Any] = {}
+            for device in devices:
+                name = device.name or ""
+                if not name.startswith("MESH-100"):
+                    continue
+                visible_devices.setdefault(name, device)
+
+            self._devices_by_name = visible_devices
+            self._last_scan_monotonic = time.monotonic()
+            visible_names = ", ".join(sorted(visible_devices)) if visible_devices else "none"
+            log(
+                "Discovery sweep finished: "
+                f"{len(visible_devices)} block(s) visible [{visible_names}]"
+            )
+            return self._devices_by_name
 
 
 class MeshRoleRunner:
-    def __init__(self, config: dict[str, Any], blocks: list[dict[str, Any]]):
+    def __init__(
+        self,
+        config: dict[str, Any],
+        blocks: list[dict[str, Any]],
+        discovery_registry: MeshDiscoveryRegistry,
+        connect_semaphore: asyncio.Semaphore,
+    ):
         self.config = config
         self.blocks = blocks
+        self.discovery_registry = discovery_registry
+        self.connect_semaphore = connect_semaphore
         primary_block = blocks[0]
         self.role = ",".join(str(block["role"]) for block in blocks)
         self.kind = str(primary_block["kind"])
@@ -117,14 +167,17 @@ class MeshRoleRunner:
         self.server_base_url = config["serverBaseUrl"].rstrip("/")
         self.scan_timeout = float(config.get("scanTimeoutSec", 10))
         self.reconnect_delay = float(config.get("reconnectDelaySec", 5))
+        self.not_found_retry_delay = float(config.get("notFoundRetrySec", min(self.reconnect_delay, 2.0)))
+        self.connect_settle_delay = float(config.get("connectSettleDelaySec", 0.75))
 
     async def run_forever(self) -> None:
         while True:
+            client: BleakClient | None = None
             try:
-                device = await find_device(self.local_name, self.scan_timeout)
+                device = await self.discovery_registry.get_device(self.local_name)
                 if device is None:
                     log(f"{self.role}: {self.local_name} not found")
-                    await asyncio.sleep(self.reconnect_delay)
+                    await asyncio.sleep(self.not_found_retry_delay)
                     continue
 
                 disconnected = asyncio.Event()
@@ -133,22 +186,35 @@ class MeshRoleRunner:
                     log(f"{self.role}: disconnected")
                     disconnected.set()
 
-                async with BleakClient(
+                client = BleakClient(
                     device,
                     disconnected_callback=_on_disconnect,
                     timeout=20.0,
-                ) as client:
+                )
+                async with self.connect_semaphore:
+                    log(f"{self.role}: connecting to {self.local_name}")
+                    await client.connect()
                     log(f"{self.role}: connected to {self.local_name}")
                     await client.start_notify(INDICATE_UUID, self._on_indicate)
                     await client.start_notify(NOTIFY_UUID, self._on_notify)
                     await client.write_gatt_char(WRITE_UUID, FEATURE_COMMAND, response=True)
                     await self._configure_block(client)
                     log(f"{self.role}: ready")
-                    await disconnected.wait()
+                    if self.connect_settle_delay > 0:
+                        await asyncio.sleep(self.connect_settle_delay)
+                await disconnected.wait()
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                self.discovery_registry.invalidate(self.local_name)
                 log(f"{self.role}: error {error}")
+            finally:
+                if client is not None:
+                    try:
+                        if client.is_connected:
+                            await client.disconnect()
+                    except Exception:
+                        pass
 
             await asyncio.sleep(self.reconnect_delay)
 
@@ -250,6 +316,9 @@ class MeshRoleRunner:
 
 async def run_bridge(config_path: Path) -> int:
     config = load_config(config_path)
+    scan_timeout = float(config.get("scanTimeoutSec", 10))
+    scan_cooldown = float(config.get("scanCooldownSec", 2.0))
+    max_concurrent_connects = max(1, int(config.get("maxConcurrentConnects", 1)))
     brightness_blocks = [
         block for block in config["blocks"] if str(block.get("kind", "")) == "brightness"
     ]
@@ -325,8 +394,21 @@ async def run_bridge(config_path: Path) -> int:
             f"Configured unique button blocks: {len(unique_button_local_names)}"
         )
 
+    discovery_registry = MeshDiscoveryRegistry(
+        scan_timeout=scan_timeout,
+        scan_cooldown=scan_cooldown,
+    )
+    connect_semaphore = asyncio.Semaphore(max_concurrent_connects)
+
     tasks = [
-        asyncio.create_task(MeshRoleRunner(config, grouped_blocks).run_forever())
+        asyncio.create_task(
+            MeshRoleRunner(
+                config,
+                grouped_blocks,
+                discovery_registry=discovery_registry,
+                connect_semaphore=connect_semaphore,
+            ).run_forever()
+        )
         for grouped_blocks in blocks_by_name.values()
     ]
     await asyncio.gather(*tasks)

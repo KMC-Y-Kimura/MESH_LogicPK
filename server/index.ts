@@ -8,27 +8,25 @@ import { matchStateManager } from "./state";
 import { realtimeManager } from "./realtime";
 import {
   calculateSuccessBreakdown,
+  DISTANCE_OPTIONS,
   determineWinner,
   getExpectedTotalBasePoints,
   normalizeGoalSensor,
 } from "./scoring";
 import {
-  validateAdjustBall,
   validateAdjustFoul,
   validateCalibration,
   validateMeshButton,
   validateResolveTurn,
-  validateSelectBall,
   validateSelectBonus,
   validateSelectDistance,
-  validateSelectShooter,
   validateSensorValue,
+  validateSetDraftOrder,
   validateSetupMatch,
   validateStartMatch,
   validateStartOvertime,
 } from "./validation";
 import {
-  AdjustBallRequest,
   AdjustFoulRequest,
   CalibrationRequest,
   DistanceId,
@@ -37,17 +35,17 @@ import {
   KnownButtonId,
   ResolveTurnRequest,
   ReviewControlFocus,
-  SelectBallRequest,
   SelectBonusRequest,
   SelectDistanceRequest,
-  SelectShooterRequest,
   SensorValueRequest,
+  SetDraftOrderRequest,
   SetupControlFocus,
   SetupMatchRequest,
   StartMatchRequest,
   StartOvertimeRequest,
   Team,
   TurnOutcome,
+  TurnState,
 } from "./types";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -59,7 +57,35 @@ const wss = new WebSocketServer({ server });
 
 app.use(express.json());
 
-let turnTimeoutId: NodeJS.Timeout | null = null;
+let phaseTimeoutId: NodeJS.Timeout | null = null;
+let pendingRefereeSingle: { timerId: NodeJS.Timeout; timestamp: number } | null = null;
+
+const SETUP_FOCUS_ORDER: SetupControlFocus[] = [
+  "firstThrowingTeam",
+  "triggerThreshold",
+  "autoCalibration",
+  "startMatch",
+  "reset",
+];
+const REVIEW_FOCUS_ORDER: ReviewControlFocus[] = [
+  "outcome",
+  "actualDistance",
+  "foulTeam",
+  "disqualifiedTeam",
+  "confirm",
+];
+const DISTANCE_ORDER: DistanceId[] = DISTANCE_OPTIONS;
+const OUTCOME_ORDER: TurnOutcome[] = ["success", "miss", "invalid"];
+const THRESHOLD_OPTIONS = [10, 15, 20, 25, 30, 35, 40, 50];
+const REFEREE_DOUBLE_CLICK_WINDOW_MS = 360;
+
+interface MeshButtonHandleResult {
+  handled: boolean;
+  summary: string;
+  recordNow?: boolean;
+  broadcastNow?: boolean;
+  recordedAction?: KnownButtonAction;
+}
 
 function otherTeam(team: Team): Team {
   return team === "red" ? "blue" : "red";
@@ -80,39 +106,19 @@ function broadcastState(): void {
   realtimeManager.broadcastStateUpdate(matchStateManager.getState());
 }
 
-function clearTurnTimeout(): void {
-  if (turnTimeoutId) {
-    clearTimeout(turnTimeoutId);
-    turnTimeoutId = null;
+function clearPhaseTimeout(): void {
+  if (phaseTimeoutId) {
+    clearTimeout(phaseTimeoutId);
+    phaseTimeoutId = null;
   }
 }
-
-const SETUP_FOCUS_ORDER: SetupControlFocus[] = [
-  "duration",
-  "firstThrowingTeam",
-  "triggerThreshold",
-  "autoCalibration",
-  "startMatch",
-  "reset",
-];
-const REVIEW_FOCUS_ORDER: ReviewControlFocus[] = [
-  "outcome",
-  "actualDistance",
-  "foulTeam",
-  "disqualifiedTeam",
-  "confirm",
-];
-const DISTANCE_ORDER: DistanceId[] = ["near", "middle", "far"];
-const OUTCOME_ORDER: TurnOutcome[] = ["success", "miss", "invalid"];
-const DURATION_OPTIONS = [10, 15, 20, 30, 45, 60];
-const THRESHOLD_OPTIONS = [10, 15, 20, 25, 30, 35, 40, 50];
 
 function cycleArrayValue<T>(values: T[], current: T | null, direction: 1 | -1): T | null {
   if (values.length === 0) {
     return null;
   }
 
-  const currentIndex = current === null ? -1 : values.indexOf(current);
+  const currentIndex = values.findIndex((value) => value === current);
   if (currentIndex < 0) {
     return values[0];
   }
@@ -172,23 +178,22 @@ function normalizeButtonAction(action: string): KnownButtonAction | null {
   }
 }
 
-function getAvailableThrowers(team: Team): Array<{ id: string; name: string }> {
-  return matchStateManager
-    .getState()
-    .teams[team].players.filter((player) => !player.hasActedInRound)
-    .map((player) => ({ id: player.id, name: player.name }));
+function formatDistanceLabel(distance: number | null): string {
+  return distance === null ? "未設定" : `${distance}m`;
 }
 
-function getAvailableBalls(team: Team): Array<{ id: string; name: string }> {
-  return matchStateManager
-    .getState()
-    .balls.filter((ball) => ball.remaining[team] > 0)
-    .map((ball) => ({ id: ball.id, name: ball.name }));
+function getDraftOrderSummary(team: Team): string {
+  const state = matchStateManager.getState();
+  return state.teams[team].throwOrderPlayerIds
+    .map((playerId) => matchStateManager.getPlayer(team, playerId)?.name ?? "不明")
+    .join(" → ");
 }
 
-function syncSelectionControlsAndBroadcast(): void {
-  matchStateManager.prepareSelectionControls();
-  broadcastState();
+function getBonusChoiceSummary(turn: TurnState, choice: "distance" | "opponentAverage"): string {
+  const state = matchStateManager.getState();
+  return choice === "distance"
+    ? `${state.teams[turn.throwingTeam].name} が自分の距離点権を使います`
+    : `${state.teams[turn.defendingTeam].name} が自分の平均基礎点権を使います`;
 }
 
 function recordButtonOutcome(
@@ -209,6 +214,70 @@ function recordButtonOutcome(
     handled,
     summary,
   });
+}
+
+function clearPendingRefereeSingle(): void {
+  if (!pendingRefereeSingle) {
+    return;
+  }
+  clearTimeout(pendingRefereeSingle.timerId);
+  pendingRefereeSingle = null;
+}
+
+function flushPendingRefereeSingle(): void {
+  if (!pendingRefereeSingle) {
+    return;
+  }
+
+  const { timestamp } = pendingRefereeSingle;
+  clearPendingRefereeSingle();
+  const result = handleRefereeButton("single");
+  recordButtonOutcome("refereeControl", "single", timestamp, result.handled, result.summary);
+  broadcastState();
+}
+
+function handleRefereeButtonWithFallback(
+  action: KnownButtonAction,
+  timestamp: number
+): MeshButtonHandleResult {
+  if (action === "single") {
+    if (
+      pendingRefereeSingle &&
+      timestamp - pendingRefereeSingle.timestamp <= REFEREE_DOUBLE_CLICK_WINDOW_MS
+    ) {
+      clearPendingRefereeSingle();
+      const result = handleRefereeButton("double");
+      return {
+        ...result,
+        recordedAction: "double",
+      };
+    }
+
+    if (pendingRefereeSingle) {
+      flushPendingRefereeSingle();
+    }
+
+    pendingRefereeSingle = {
+      timestamp,
+      timerId: setTimeout(() => {
+        const queued = pendingRefereeSingle;
+        if (!queued || queued.timestamp !== timestamp) {
+          return;
+        }
+        flushPendingRefereeSingle();
+      }, REFEREE_DOUBLE_CLICK_WINDOW_MS),
+    };
+
+    return {
+      handled: true,
+      summary: "審判単押しを受け付けました",
+      recordNow: false,
+      broadcastNow: false,
+    };
+  }
+
+  clearPendingRefereeSingle();
+  return handleRefereeButton(action);
 }
 
 function runAutoCalibration(): CalibrationRequest {
@@ -232,6 +301,203 @@ function runAutoCalibration(): CalibrationRequest {
   return calibration;
 }
 
+function getSetupRuleErrors(): string[] {
+  const state = matchStateManager.getState();
+  const errors: string[] = [];
+
+  const redPlayers = state.teams.red.players.length;
+  const bluePlayers = state.teams.blue.players.length;
+
+  if (redPlayers <= 0 || bluePlayers <= 0) {
+    errors.push("両チームに最低1人の選手が必要です");
+  }
+  if (redPlayers !== bluePlayers) {
+    errors.push("両チームの人数は同じでなければなりません");
+  }
+
+  (["red", "blue"] as Team[]).forEach((team) => {
+    const teamState = state.teams[team];
+    const expected = getExpectedTotalBasePoints(teamState.players.length);
+    if (teamState.totalBasePoints !== expected) {
+      errors.push(
+        `${teamState.name} の基礎点合計は ${expected} 点である必要があります（現在 ${teamState.totalBasePoints} 点）`
+      );
+    }
+  });
+
+  return errors;
+}
+
+function isSelectionComplete(): boolean {
+  const turn = matchStateManager.getState().currentTurn;
+  if (!turn) {
+    return false;
+  }
+
+  return Boolean(turn.selection.shooterId && turn.selection.distanceId && turn.selection.bonusChoice);
+}
+
+function getPhaseDurationSec(): number | null {
+  const state = matchStateManager.getState();
+  if (state.phase === "draft") {
+    return state.draftDurationSec;
+  }
+  if (state.phase === "selection") {
+    return state.selectionDurationSec;
+  }
+  if (state.phase === "active") {
+    return state.activeDurationSec;
+  }
+
+  return null;
+}
+
+function startPhaseTimer(): void {
+  clearPhaseTimeout();
+  const durationSec = getPhaseDurationSec();
+  if (durationSec === null) {
+    return;
+  }
+  phaseTimeoutId = setTimeout(handlePhaseTimeout, durationSec * 1000);
+}
+
+function beginSelectionPhase(turn: TurnState, message: string, eventType = "TURN_SELECTION_START"): void {
+  clearPhaseTimeout();
+  matchStateManager.clearSensorTriggeredState();
+  matchStateManager.setCurrentTurn(turn);
+  matchStateManager.setPhase("selection", Date.now());
+  matchStateManager.prepareSelectionControls();
+  addEventLog(eventType, message, {
+    turnNumber: turn.turnNumber,
+    throwingTeam: turn.throwingTeam,
+    defendingTeam: turn.defendingTeam,
+    shooterId: turn.selection.shooterId,
+  });
+  broadcastState();
+  startPhaseTimer();
+}
+
+function startNextTurnOrFinishFromResult(): void {
+  const state = matchStateManager.getState();
+  const turn = state.currentTurn;
+  if (!turn) {
+    throw new Error("Current turn is missing");
+  }
+
+  if (turn.disqualifiedTeam) {
+    const winner = otherTeam(turn.disqualifiedTeam);
+    matchStateManager.setWinner(winner, "disqualification");
+    matchStateManager.setFinishedAt(Date.now());
+    matchStateManager.setPhase("finished", null);
+    matchStateManager.setRequiresOvertime(false);
+    matchStateManager.resetButtonControlsForSetup();
+    matchStateManager.updateSetupControl({ focus: "startMatch" });
+    addEventLog(
+      "MATCH_DISQUALIFIED",
+      `${state.teams[turn.disqualifiedTeam].name} が失格になりました`,
+      { winner }
+    );
+    broadcastState();
+    return;
+  }
+
+  if (matchStateManager.haveAllPlayersActedThisRound()) {
+    const finalState = matchStateManager.getState();
+    const winnerInfo = determineWinner({
+      redRawScore: finalState.teams.red.rawScore,
+      blueRawScore: finalState.teams.blue.rawScore,
+      redFouls: finalState.teams.red.fouls,
+      blueFouls: finalState.teams.blue.fouls,
+      redDisqualified: finalState.teams.red.disqualified,
+      blueDisqualified: finalState.teams.blue.disqualified,
+    });
+
+    matchStateManager.setWinner(winnerInfo.winner, winnerInfo.reason);
+    matchStateManager.setFinishedAt(Date.now());
+    matchStateManager.setPhase("finished", null);
+    matchStateManager.setRequiresOvertime(winnerInfo.winner === "draw");
+    matchStateManager.resetButtonControlsForSetup();
+    matchStateManager.updateSetupControl({ focus: "startMatch" });
+
+    if (winnerInfo.winner === "draw") {
+      addEventLog("MATCH_DRAW", "同点です。延長戦が必要です");
+    } else if (winnerInfo.winner === "red" || winnerInfo.winner === "blue") {
+      addEventLog("MATCH_FINISHED", `${finalState.teams[winnerInfo.winner].name} の勝ちです`, {
+        reason: winnerInfo.reason,
+      });
+    }
+
+    broadcastState();
+    return;
+  }
+
+  const nextTurn = matchStateManager.createNextTurn();
+  beginSelectionPhase(
+    nextTurn,
+    `次のターンを開始します（ターン ${nextTurn.turnNumber}）`,
+    "TURN_NEXT"
+  );
+}
+
+function autoFillRemainingDraftOrderAndMaybeStart(message: string): void {
+  matchStateManager.autoCompleteDraftOrders();
+  matchStateManager.prepareDraftControls();
+  addEventLog("DRAFT_COMPLETED", message, {
+    redOrder: getDraftOrderSummary("red"),
+    blueOrder: getDraftOrderSummary("blue"),
+  });
+
+  const firstTurn = matchStateManager.createInitialTurn();
+  beginSelectionPhase(firstTurn, "投球順が確定したため、最初のターン選択へ進みます");
+}
+
+function lockCurrentSelectionFromCandidates(): void {
+  const state = matchStateManager.getState();
+  const turn = state.currentTurn;
+  if (!turn) {
+    return;
+  }
+
+  const throwingControl = state.buttonControls.team[turn.throwingTeam];
+  const defendingControl = state.buttonControls.team[turn.defendingTeam];
+  const availableBonusChoices = matchStateManager.getAvailableBonusChoices(turn);
+
+  if (!turn.selection.distanceId) {
+    matchStateManager.updateCurrentSelection({
+      distanceId: throwingControl.candidateDistanceId ?? DISTANCE_ORDER[0] ?? null,
+    });
+  }
+
+  const refreshedTurn = matchStateManager.getState().currentTurn;
+  if (refreshedTurn && !refreshedTurn.selection.bonusChoice) {
+    matchStateManager.updateCurrentSelection({
+      bonusChoice:
+        defendingControl.candidateBonusChoice && availableBonusChoices.includes(defendingControl.candidateBonusChoice)
+          ? defendingControl.candidateBonusChoice
+          : availableBonusChoices[0] ?? null,
+    });
+  }
+
+  matchStateManager.prepareSelectionControls();
+}
+
+function enterReview(reason: string, details?: Record<string, unknown>): void {
+  const state = matchStateManager.getState();
+  if (state.phase !== "active") {
+    return;
+  }
+
+  clearPhaseTimeout();
+  matchStateManager.setPhase("review", null);
+  matchStateManager.updateCurrentTurn({
+    reviewStartedAt: Date.now(),
+    notes: reason,
+  });
+  matchStateManager.prepareReviewControls();
+  addEventLog("TURN_REVIEW", reason, details);
+  broadcastState();
+}
+
 function resolveUsingReviewControl(): void {
   const review = matchStateManager.getState().buttonControls.review;
   finalizeResolvedTurn({
@@ -243,6 +509,104 @@ function resolveUsingReviewControl(): void {
   });
 }
 
+function resolveActiveTurnImmediately(timeoutTriggered = false): void {
+  const state = matchStateManager.getState();
+  const turn = state.currentTurn;
+  if (!turn) {
+    throw new Error("Current turn is missing");
+  }
+
+  finalizeResolvedTurn({
+    outcome: turn.sensorTriggeredAt ? "success" : "miss",
+    actualDistanceId: turn.selection.distanceId,
+    foulTeam: null,
+    disqualifiedTeam: null,
+    notes: timeoutTriggered ? "投球時間が終了しました" : turn.notes,
+  });
+}
+
+function handlePhaseTimeout(): void {
+  const state = matchStateManager.getState();
+
+  if (state.phase === "draft") {
+    autoFillRemainingDraftOrderAndMaybeStart("投球順決定の制限時間が終了したため、残りを自動確定しました");
+    return;
+  }
+
+  if (state.phase === "selection") {
+    lockCurrentSelectionFromCandidates();
+    if (!isSelectionComplete()) {
+      addEventLog("TURN_SELECTION_TIMEOUT", "選択時間が終了しましたが、選択を確定できませんでした");
+      broadcastState();
+      return;
+    }
+    matchStateManager.setPhase("confirmation", null);
+    matchStateManager.updateCurrentTurn({
+      notes: "選択時間終了のため、自動で確認画面へ進みました",
+    });
+    addEventLog("TURN_SELECTION_TIMEOUT", "選択時間が終了したため、確認画面へ進みました");
+    broadcastState();
+    return;
+  }
+
+  if (state.phase === "active") {
+    addEventLog("TURN_TIMEOUT", "投球時間が終了しました");
+    resolveActiveTurnImmediately(true);
+  }
+}
+
+function handleOrderTeamButton(
+  team: Team,
+  command: "cycle" | "confirm"
+): { handled: boolean; summary: string } {
+  const state = matchStateManager.getState();
+  if (state.phase !== "draft") {
+    return { handled: false, summary: "現在は投球順決定フェーズではありません" };
+  }
+
+  const control = state.buttonControls.team[team];
+  const remainingPlayers = matchStateManager.getRemainingDraftPlayers(team);
+
+  if (remainingPlayers.length === 0) {
+    return { handled: false, summary: `${state.teams[team].name} の投球順は確定済みです` };
+  }
+
+  if (command === "cycle") {
+    const next = cycleArrayValue(
+      remainingPlayers.map((player) => player.id),
+      control.candidatePlayerId,
+      1
+    );
+    const nextName = next ? matchStateManager.getPlayer(team, next)?.name ?? "未設定" : "未設定";
+    matchStateManager.updateTeamControl(team, { candidatePlayerId: next });
+    broadcastState();
+    return {
+      handled: true,
+      summary: `候補を ${nextName} に変更しました`,
+    };
+  }
+
+  const candidatePlayerId = control.candidatePlayerId ?? remainingPlayers[0]?.id ?? null;
+  if (!candidatePlayerId) {
+    return { handled: false, summary: "候補選手がいません" };
+  }
+
+  if (!matchStateManager.appendDraftOrder(team, candidatePlayerId)) {
+    return { handled: false, summary: "その選手は投球順に追加できません" };
+  }
+
+  matchStateManager.prepareDraftControls();
+
+  const playerName = matchStateManager.getPlayer(team, candidatePlayerId)?.name ?? "不明";
+  if (matchStateManager.isDraftComplete()) {
+    autoFillRemainingDraftOrderAndMaybeStart("両チームの投球順が確定しました");
+    return { handled: true, summary: `${playerName} を追加し、投球順決定を完了しました` };
+  }
+
+  broadcastState();
+  return { handled: true, summary: `${playerName} を投球順に追加しました` };
+}
+
 function handleThrowingTeamButton(
   team: Team,
   command: "cycle" | "confirm"
@@ -250,85 +614,41 @@ function handleThrowingTeamButton(
   const state = matchStateManager.getState();
   const currentTurn = state.currentTurn;
   if (state.phase !== "selection" || !currentTurn || currentTurn.throwingTeam !== team) {
-    return { handled: false, summary: "このチームは現在、投げる側の選択フェーズではありません" };
+    return { handled: false, summary: "このチームは現在、距離選択フェーズではありません" };
   }
 
   const control = state.buttonControls.team[team];
   if (control.mode === "done") {
     if (command === "confirm") {
-      matchStateManager.updateCurrentSelection({
-        shooterId: null,
-        distanceId: null,
-      });
+      matchStateManager.updateCurrentSelection({ distanceId: null });
       matchStateManager.prepareSelectionControls();
       broadcastState();
-      return { handled: true, summary: "投げる側の選択をやり直します" };
+      return { handled: true, summary: "距離選択をやり直します" };
     }
-    return { handled: false, summary: "投げる側の選択は確定済みです。確定ボタンでやり直せます" };
+    return { handled: false, summary: "距離は確定済みです。確定ボタンでやり直せます" };
   }
 
-  if (control.mode === "shooter") {
-    const options = getAvailableThrowers(team);
-    if (options.length === 0) {
-      return { handled: false, summary: "選択可能な投球者がいません" };
-    }
-
-    if (command === "cycle") {
-      const next = cycleArrayValue(
-        options.map((option) => option.id),
-        control.candidatePlayerId,
-        1
-      );
-      matchStateManager.updateTeamControl(team, { candidatePlayerId: next });
-      broadcastState();
-      return {
-        handled: true,
-        summary: `投球者候補を ${options.find((option) => option.id === next)?.name ?? "未設定"} に変更しました`,
-      };
-    }
-
-    if (!control.candidatePlayerId) {
-      return { handled: false, summary: "投球者候補がありません" };
-    }
-
-    matchStateManager.updateCurrentSelection({ shooterId: control.candidatePlayerId });
-    matchStateManager.updateTeamControl(team, { mode: "distance" });
-    matchStateManager.prepareSelectionControls();
+  if (command === "cycle") {
+    const next = cycleArrayValue(DISTANCE_ORDER, control.candidateDistanceId, 1);
+    matchStateManager.updateTeamControl(team, { candidateDistanceId: next });
     broadcastState();
     return {
       handled: true,
-      summary: `投球者を ${
-        options.find((option) => option.id === control.candidatePlayerId)?.name ?? "不明"
-      } に確定しました`,
+      summary: `距離候補を ${formatDistanceLabel(next)} に変更しました`,
     };
   }
 
-  if (control.mode === "distance") {
-    if (command === "cycle") {
-      const next = cycleArrayValue(DISTANCE_ORDER, control.candidateDistanceId, 1);
-      matchStateManager.updateTeamControl(team, { candidateDistanceId: next });
-      broadcastState();
-      return {
-        handled: true,
-        summary: `距離候補を ${next ?? "未設定"} に変更しました`,
-      };
-    }
-
-    if (!control.candidateDistanceId) {
-      return { handled: false, summary: "距離候補がありません" };
-    }
-
-    matchStateManager.updateCurrentSelection({ distanceId: control.candidateDistanceId });
-    matchStateManager.updateTeamControl(team, { mode: "done" });
-    matchStateManager.prepareSelectionControls();
-    broadcastState();
-    return {
-      handled: true,
-      summary: `距離を ${control.candidateDistanceId} に確定しました`,
-    };
+  if (!control.candidateDistanceId) {
+    return { handled: false, summary: "距離候補がありません" };
   }
 
-  return { handled: false, summary: "投げる側ボタンの状態が不正です" };
+  matchStateManager.updateCurrentSelection({ distanceId: control.candidateDistanceId });
+  matchStateManager.prepareSelectionControls();
+  broadcastState();
+  return {
+    handled: true,
+    summary: `距離を ${formatDistanceLabel(control.candidateDistanceId)} に確定しました`,
+  };
 }
 
 function handleDefendingTeamButton(
@@ -338,104 +658,83 @@ function handleDefendingTeamButton(
   const state = matchStateManager.getState();
   const currentTurn = state.currentTurn;
   if (state.phase !== "selection" || !currentTurn || currentTurn.defendingTeam !== team) {
-    return { handled: false, summary: "このチームは現在、守る側の選択フェーズではありません" };
+    return { handled: false, summary: "このチームは現在、追加得点権の選択フェーズではありません" };
   }
 
   const control = state.buttonControls.team[team];
+  const choices = matchStateManager.getAvailableBonusChoices(currentTurn);
+  if (choices.length === 0) {
+    return { handled: false, summary: "使える追加得点権がありません" };
+  }
+
   if (control.mode === "done") {
     if (command === "confirm") {
-      matchStateManager.updateCurrentSelection({
-        ballId: null,
-        bonusChoice: null,
-      });
+      matchStateManager.updateCurrentSelection({ bonusChoice: null });
       matchStateManager.prepareSelectionControls();
       broadcastState();
-      return { handled: true, summary: "守る側の選択をやり直します" };
+      return { handled: true, summary: "追加得点権の選択をやり直します" };
     }
-    return { handled: false, summary: "守る側の選択は確定済みです。確定ボタンでやり直せます" };
+    return { handled: false, summary: "追加得点権は確定済みです。確定ボタンでやり直せます" };
   }
 
-  if (control.mode === "ball") {
-    const options = getAvailableBalls(team);
-    if (options.length === 0) {
-      return { handled: false, summary: "残っているボールがありません" };
+  if (command === "cycle") {
+    const next = cycleArrayValue(choices, control.candidateBonusChoice, 1);
+    if (!next) {
+      return { handled: false, summary: "追加得点権の候補がありません" };
     }
-
-    if (command === "cycle") {
-      const next = cycleArrayValue(
-        options.map((option) => option.id),
-        control.candidateBallId,
-        1
-      );
-      matchStateManager.updateTeamControl(team, { candidateBallId: next });
-      broadcastState();
-      return {
-        handled: true,
-        summary: `ボール候補を ${options.find((option) => option.id === next)?.name ?? "未設定"} に変更しました`,
-      };
-    }
-
-    if (!control.candidateBallId) {
-      return { handled: false, summary: "ボール候補がありません" };
-    }
-
-    matchStateManager.updateCurrentSelection({
-      ballId: control.candidateBallId,
-      bonusChoice: null,
-    });
-    matchStateManager.updateTeamControl(team, { mode: "bonus" });
-    matchStateManager.prepareSelectionControls();
+    matchStateManager.updateTeamControl(team, { candidateBonusChoice: next });
     broadcastState();
     return {
       handled: true,
-      summary: `ボールを ${
-        options.find((option) => option.id === control.candidateBallId)?.name ?? "不明"
-      } に確定しました`,
+      summary: `追加得点権を ${getBonusChoiceSummary(currentTurn, next)} に変更しました`,
     };
   }
 
-  if (control.mode === "bonus") {
-    const choices = matchStateManager.getAvailableBonusChoices(currentTurn);
-    if (choices.length === 0) {
-      return { handled: false, summary: "追加得点の向きに使える権利がありません" };
-    }
-
-    if (command === "cycle") {
-      const next = cycleArrayValue(choices, control.candidateBonusChoice, 1);
-      matchStateManager.updateTeamControl(team, { candidateBonusChoice: next });
-      broadcastState();
-      return {
-        handled: true,
-        summary: `追加得点の向きを ${next === "opponentAverage" ? "自チームへ平均基礎点" : "相手側へ距離点"} に変更しました`,
-      };
-    }
-
-    if (!control.candidateBonusChoice || !choices.includes(control.candidateBonusChoice)) {
-      return { handled: false, summary: "追加得点の向き候補がありません" };
-    }
-
-    matchStateManager.updateCurrentSelection({ bonusChoice: control.candidateBonusChoice });
-    matchStateManager.updateTeamControl(team, { mode: "done" });
-    matchStateManager.prepareSelectionControls();
-    broadcastState();
-    return {
-      handled: true,
-      summary: `追加得点の向きを ${
-        control.candidateBonusChoice === "opponentAverage" ? "自チームへ平均基礎点" : "相手側へ距離点"
-      } に確定しました`,
-    };
+  if (!control.candidateBonusChoice || !choices.includes(control.candidateBonusChoice)) {
+    return { handled: false, summary: "追加得点権の候補がありません" };
   }
 
-  return { handled: false, summary: "守る側ボタンの状態が不正です" };
+  matchStateManager.updateCurrentSelection({ bonusChoice: control.candidateBonusChoice });
+  matchStateManager.prepareSelectionControls();
+  broadcastState();
+  return {
+    handled: true,
+    summary: `追加得点権を ${getBonusChoiceSummary(currentTurn, control.candidateBonusChoice)} に確定しました`,
+  };
+}
+
+function handleDraftRefereeButton(action: KnownButtonAction): { handled: boolean; summary: string } {
+  if (action !== "long") {
+    return { handled: false, summary: "投球順決定中は長押しで残りを確定して次へ進みます" };
+  }
+
+  autoFillRemainingDraftOrderAndMaybeStart("審判が投球順決定を終了しました");
+  return { handled: true, summary: "投球順を確定して、最初のターン選択へ進みました" };
 }
 
 function handleSelectionRefereeButton(action: KnownButtonAction): { handled: boolean; summary: string } {
   if (action !== "long") {
-    return { handled: false, summary: "選択フェーズでは長押しでターン開始します" };
+    return { handled: false, summary: "選択フェーズでは長押しで確認画面へ進みます" };
   }
 
+  lockCurrentSelectionFromCandidates();
   if (!isSelectionComplete()) {
-    return { handled: false, summary: "選択が未完了のためターン開始できません" };
+    return { handled: false, summary: "選択が未完了のため確認へ進めません" };
+  }
+
+  clearPhaseTimeout();
+  matchStateManager.setPhase("confirmation", null);
+  matchStateManager.updateCurrentTurn({
+    notes: "両チームの選択確認中です",
+  });
+  addEventLog("TURN_CONFIRMATION", "選択確認画面へ進みました");
+  broadcastState();
+  return { handled: true, summary: "選択確認画面へ進みました" };
+}
+
+function handleConfirmationRefereeButton(action: KnownButtonAction): { handled: boolean; summary: string } {
+  if (action !== "long") {
+    return { handled: false, summary: "選択確認フェーズでは長押しで投球開始します" };
   }
 
   const state = matchStateManager.getState();
@@ -443,28 +742,26 @@ function handleSelectionRefereeButton(action: KnownButtonAction): { handled: boo
     return { handled: false, summary: "現在のターンがありません" };
   }
 
-  const ballId = state.currentTurn.selection.ballId;
-  if (!ballId || !matchStateManager.consumeBall(state.currentTurn.defendingTeam, ballId)) {
-    return { handled: false, summary: "選択ボールの残数がありません" };
-  }
-
+  const startedAt = Date.now();
   matchStateManager.clearSensorTriggeredState();
   matchStateManager.updateCurrentTurn({
-    startedAt: Date.now(),
+    startedAt,
     reviewStartedAt: null,
+    resolvedAt: null,
     sensorTriggeredAt: null,
     outcome: null,
-    scoreBreakdown: null,
+    actualDistanceId: null,
     foulTeam: null,
     disqualifiedTeam: null,
+    scoreBreakdown: null,
     notes: null,
   });
-  matchStateManager.setPhase("active");
   matchStateManager.clearReviewControls();
+  matchStateManager.setPhase("active", startedAt);
   addEventLog("TURN_START", `ターン ${state.currentTurn.turnNumber} を開始しました`);
   broadcastState();
-  startTurnTimer();
-  return { handled: true, summary: "ターンを開始しました" };
+  startPhaseTimer();
+  return { handled: true, summary: "投球を開始しました" };
 }
 
 function handleSetupOrFinishedRefereeButton(
@@ -485,20 +782,11 @@ function handleSetupOrFinishedRefereeButton(
   }
 
   switch (focus) {
-    case "duration": {
-      const next = cycleArrayValue(DURATION_OPTIONS, state.turnDurationSec, 1);
-      if (next === null) {
-        return { handled: false, summary: "制限時間候補がありません" };
-      }
-      matchStateManager.setTurnDurationSec(next);
-      broadcastState();
-      return { handled: true, summary: `制限時間を ${next} 秒に変更しました` };
-    }
     case "firstThrowingTeam": {
       const nextTeam = otherTeam(state.firstThrowingTeam);
       matchStateManager.setFirstThrowingTeam(nextTeam);
       broadcastState();
-      return { handled: true, summary: `先攻を ${nextTeam} に変更しました` };
+      return { handled: true, summary: `先攻を ${state.teams[nextTeam].name} に変更しました` };
     }
     case "triggerThreshold": {
       const next = cycleArrayValue(
@@ -538,10 +826,10 @@ function handleSetupOrFinishedRefereeButton(
       }
 
       startMatch(state.firstThrowingTeam, false);
-      return { handled: true, summary: "試合を開始しました" };
+      return { handled: true, summary: "投球順決定を開始しました" };
     }
     case "reset": {
-      clearTurnTimeout();
+      clearPhaseTimeout();
       matchStateManager.resetToSetup();
       addEventLog("MATCH_RESET", "試合状態をリセットしました");
       broadcastState();
@@ -576,11 +864,17 @@ function handleReviewRefereeButton(action: KnownButtonAction): { handled: boolea
       }
       case "actualDistance": {
         const currentSelectionDistance = state.currentTurn?.selection.distanceId ?? null;
-        const values = [currentSelectionDistance, ...DISTANCE_ORDER.filter((value) => value !== currentSelectionDistance)];
+        const values = [
+          currentSelectionDistance,
+          ...DISTANCE_ORDER.filter((value) => value !== currentSelectionDistance),
+        ];
         const next = cycleArrayValue(values, review.actualDistanceId, 1);
         matchStateManager.updateReviewControl({ actualDistanceId: next });
         broadcastState();
-        return { handled: true, summary: `実距離候補を ${next ?? "選択どおり"} に変更しました` };
+        return {
+          handled: true,
+          summary: `実距離候補を ${next === null ? "選択どおり" : formatDistanceLabel(next)} に変更しました`,
+        };
       }
       case "foulTeam": {
         const next = cycleArrayValue<Team | null>([null, "red", "blue"], review.foulTeam, 1);
@@ -605,12 +899,17 @@ function handleReviewRefereeButton(action: KnownButtonAction): { handled: boolea
     }
   }
 
-  if (review.focus !== "confirm") {
-    return { handled: false, summary: "confirm 項目へ移動して長押しすると確定します" };
+  resolveUsingReviewControl();
+  return { handled: true, summary: "レビュー内容でターン結果を確定しました" };
+}
+
+function handleResultRefereeButton(action: KnownButtonAction): { handled: boolean; summary: string } {
+  if (action !== "long") {
+    return { handled: false, summary: "結果画面では長押しで次のターンへ進みます" };
   }
 
-  resolveUsingReviewControl();
-  return { handled: true, summary: "レビュー内容でターンを確定しました" };
+  startNextTurnOrFinishFromResult();
+  return { handled: true, summary: "次のステージへ進みました" };
 }
 
 function handleRefereeButton(action: KnownButtonAction): { handled: boolean; summary: string } {
@@ -620,20 +919,38 @@ function handleRefereeButton(action: KnownButtonAction): { handled: boolean; sum
     return handleSetupOrFinishedRefereeButton(action);
   }
 
+  if (phase === "draft") {
+    return handleDraftRefereeButton(action);
+  }
+
   if (phase === "selection") {
     return handleSelectionRefereeButton(action);
   }
 
+  if (phase === "confirmation") {
+    return handleConfirmationRefereeButton(action);
+  }
+
   if (phase === "active") {
-    if (action !== "long") {
-      return { handled: false, summary: "投球中は長押しでレビューへ移行します" };
+    if (action === "double") {
+      enterReview("審判が詳細判定のためレビューへ移行しました");
+      return { handled: true, summary: "詳細判定画面を開きました" };
     }
-    enterReview("審判ボタンでレビューへ移行しました");
-    return { handled: true, summary: "レビューへ移行しました" };
+
+    if (action !== "long") {
+      return { handled: false, summary: "投球中は長押しで確定、ダブルクリックで詳細判定です" };
+    }
+
+    resolveActiveTurnImmediately(false);
+    return { handled: true, summary: "現在の判定内容でターンを確定しました" };
   }
 
   if (phase === "review") {
     return handleReviewRefereeButton(action);
+  }
+
+  if (phase === "result") {
+    return handleResultRefereeButton(action);
   }
 
   return { handled: false, summary: "現在のフェーズでは審判ボタンを処理できません" };
@@ -642,8 +959,8 @@ function handleRefereeButton(action: KnownButtonAction): { handled: boolean; sum
 function handleMeshButtonInput(
   buttonId: string,
   action: string,
-  _timestamp: number
-): { handled: boolean; summary: string } {
+  timestamp: number
+): MeshButtonHandleResult {
   const normalizedButtonId = normalizeButtonId(buttonId);
   const normalizedAction = normalizeButtonAction(action);
 
@@ -652,160 +969,85 @@ function handleMeshButtonInput(
   }
 
   if (normalizedButtonId === "redCycle") {
+    const orderResult = handleOrderTeamButton("red", "cycle");
+    if (orderResult.handled || matchStateManager.getState().phase === "draft") {
+      return orderResult;
+    }
     const throwingResult = handleThrowingTeamButton("red", "cycle");
-    return throwingResult.handled
-      ? throwingResult
-      : handleDefendingTeamButton("red", "cycle");
+    return throwingResult.handled ? throwingResult : handleDefendingTeamButton("red", "cycle");
   }
 
   if (normalizedButtonId === "redConfirm") {
+    const orderResult = handleOrderTeamButton("red", "confirm");
+    if (orderResult.handled || matchStateManager.getState().phase === "draft") {
+      return orderResult;
+    }
     const throwingResult = handleThrowingTeamButton("red", "confirm");
-    return throwingResult.handled
-      ? throwingResult
-      : handleDefendingTeamButton("red", "confirm");
+    return throwingResult.handled ? throwingResult : handleDefendingTeamButton("red", "confirm");
   }
 
   if (normalizedButtonId === "blueCycle") {
+    const orderResult = handleOrderTeamButton("blue", "cycle");
+    if (orderResult.handled || matchStateManager.getState().phase === "draft") {
+      return orderResult;
+    }
     const throwingResult = handleThrowingTeamButton("blue", "cycle");
-    return throwingResult.handled
-      ? throwingResult
-      : handleDefendingTeamButton("blue", "cycle");
+    return throwingResult.handled ? throwingResult : handleDefendingTeamButton("blue", "cycle");
   }
 
   if (normalizedButtonId === "blueConfirm") {
+    const orderResult = handleOrderTeamButton("blue", "confirm");
+    if (orderResult.handled || matchStateManager.getState().phase === "draft") {
+      return orderResult;
+    }
     const throwingResult = handleThrowingTeamButton("blue", "confirm");
-    return throwingResult.handled
-      ? throwingResult
-      : handleDefendingTeamButton("blue", "confirm");
+    return throwingResult.handled ? throwingResult : handleDefendingTeamButton("blue", "confirm");
   }
 
   if (normalizedButtonId === "refereeControl") {
-    return handleRefereeButton(normalizedAction);
+    return handleRefereeButtonWithFallback(normalizedAction, timestamp);
   }
 
   return { handled: false, summary: "未対応のボタンです" };
 }
 
-function getSetupRuleErrors(): string[] {
-  const state = matchStateManager.getState();
-  const errors: string[] = [];
-
-  const redPlayers = state.teams.red.players.length;
-  const bluePlayers = state.teams.blue.players.length;
-
-  if (redPlayers <= 0 || bluePlayers <= 0) {
-    errors.push("両チームに最低1人の選手が必要です");
-  }
-  if (redPlayers !== bluePlayers) {
-    errors.push("両チームの人数は同じでなければなりません");
-  }
-
-  (["red", "blue"] as Team[]).forEach((team) => {
-    const teamState = state.teams[team];
-    const expected = getExpectedTotalBasePoints(teamState.players.length);
-    if (teamState.totalBasePoints !== expected) {
-      errors.push(
-        `${teamState.name} の基礎点合計は ${expected} 点である必要があります（現在 ${teamState.totalBasePoints} 点）`
-      );
-    }
-  });
-
-  if (state.balls.length < 3) {
-    errors.push("ボールは3種類以上必要です");
-  }
-
-  return errors;
-}
-
-function isSelectionComplete(): boolean {
-  const turn = matchStateManager.getState().currentTurn;
-  if (!turn) {
-    return false;
-  }
-
-  return Boolean(
-    turn.selection.shooterId &&
-      turn.selection.distanceId &&
-      turn.selection.ballId &&
-      turn.selection.bonusChoice
-  );
-}
-
-function createTurnForStart(team: Team, turnNumber: number, roundNumber: number) {
-  return matchStateManager.createTurnFor(team, turnNumber, roundNumber);
-}
-
 function startMatch(firstThrowingTeam?: Team, isOvertime = false): void {
-  clearTurnTimeout();
+  clearPhaseTimeout();
 
   const state = matchStateManager.getState();
   const chosenFirstTeam = firstThrowingTeam ?? state.firstThrowingTeam;
-  const roundNumber = isOvertime ? state.roundNumber + 1 : 1;
-  const turnNumber = isOvertime ? state.history.length + 1 : 1;
 
-  if (!isOvertime) {
-    matchStateManager.resetScoresAndRoundFlags();
-    matchStateManager.setStartedAt(Date.now());
-    matchStateManager.setState({ history: [] });
-  } else {
-    matchStateManager.resetRoundFlagsOnly();
-  }
-
-  matchStateManager.resetBallsToInitial();
   matchStateManager.clearSensorTriggeredState();
-  matchStateManager.setRoundNumber(roundNumber);
+  matchStateManager.setIsOvertime(isOvertime);
   matchStateManager.setFirstThrowingTeam(chosenFirstTeam);
   matchStateManager.setFinishedAt(null);
   matchStateManager.setWinner(null, null);
   matchStateManager.setRequiresOvertime(false);
-  matchStateManager.setCurrentTurn(createTurnForStart(chosenFirstTeam, turnNumber, roundNumber));
-  matchStateManager.setPhase("selection");
+  matchStateManager.setCurrentTurn(null);
   matchStateManager.normalizeSetupCandidates();
-  matchStateManager.prepareSelectionControls();
 
-  addEventLog(
-    isOvertime ? "OVERTIME_START" : "MATCH_START",
-    isOvertime
-      ? `延長戦を開始しました（ラウンド ${roundNumber}）`
-      : "試合を開始しました"
-  );
-  broadcastState();
-}
-
-function enterReview(reason: string, details?: Record<string, unknown>): void {
-  const state = matchStateManager.getState();
-  if (state.phase !== "active") {
+  if (!isOvertime) {
+    matchStateManager.resetScoresAndRoundFlags();
+    matchStateManager.clearThrowOrders();
+    matchStateManager.setStartedAt(Date.now());
+    matchStateManager.setState({ history: [] });
+    matchStateManager.prepareDraftControls();
+    matchStateManager.setPhase("draft", Date.now());
+    addEventLog("MATCH_START", "試合を開始しました。投球順決定を始めてください");
+    broadcastState();
+    startPhaseTimer();
     return;
   }
 
-  clearTurnTimeout();
-  matchStateManager.setPhase("review");
-  matchStateManager.updateCurrentTurn({
-    reviewStartedAt: Date.now(),
-    notes: reason,
-  });
-  matchStateManager.prepareReviewControls();
-  addEventLog("TURN_REVIEW", reason, details);
-  broadcastState();
-}
-
-function handleTurnTimeout(): void {
-  const state = matchStateManager.getState();
-  if (state.phase !== "active") {
-    return;
-  }
-
-  enterReview("投球ターンの制限時間が終了しました");
-}
-
-function startTurnTimer(): void {
-  clearTurnTimeout();
-  const state = matchStateManager.getState();
-  turnTimeoutId = setTimeout(handleTurnTimeout, state.turnDurationSec * 1000);
+  matchStateManager.resetRoundFlagsOnly();
+  const turnNumber = state.history.length + 1;
+  const firstTurn = matchStateManager.createTurnFor(chosenFirstTeam, turnNumber, true);
+  addEventLog("OVERTIME_START", "延長戦を開始しました");
+  beginSelectionPhase(firstTurn, "延長戦のターン選択を開始します");
 }
 
 function finalizeResolvedTurn(resolution: ResolveTurnRequest): void {
-  clearTurnTimeout();
+  clearPhaseTimeout();
 
   const state = matchStateManager.getState();
   const turn = state.currentTurn;
@@ -856,31 +1098,16 @@ function finalizeResolvedTurn(resolution: ResolveTurnRequest): void {
     disqualifiedTeam: resolution.disqualifiedTeam ?? null,
     scoreBreakdown,
     notes,
+    resolvedAt: Date.now(),
   });
   matchStateManager.appendCurrentTurnToHistory();
   matchStateManager.clearSensorTriggeredState();
   matchStateManager.clearReviewControls();
+  matchStateManager.setPhase("result", null);
 
-  const updatedState = matchStateManager.getState();
-  const updatedTurn = updatedState.currentTurn;
+  const updatedTurn = matchStateManager.getState().currentTurn;
   if (!updatedTurn) {
     throw new Error("Resolved turn disappeared unexpectedly");
-  }
-
-  if (resolution.disqualifiedTeam) {
-    const winner = otherTeam(resolution.disqualifiedTeam);
-    matchStateManager.setWinner(winner, "disqualification");
-    matchStateManager.setFinishedAt(Date.now());
-    matchStateManager.setPhase("finished");
-    matchStateManager.setRequiresOvertime(false);
-    matchStateManager.resetButtonControlsForSetup();
-    addEventLog(
-      "MATCH_DISQUALIFIED",
-      `${updatedState.teams[resolution.disqualifiedTeam].name} が失格になりました`,
-      { winner }
-    );
-    broadcastState();
-    return;
   }
 
   const outcomeLabel =
@@ -896,53 +1123,10 @@ function finalizeResolvedTurn(resolution: ResolveTurnRequest): void {
     {
       turnNumber: updatedTurn.turnNumber,
       throwingTeam: updatedTurn.throwingTeam,
+      bonusChoice: updatedTurn.selection.bonusChoice,
       foulTeam: resolution.foulTeam ?? null,
+      disqualifiedTeam: resolution.disqualifiedTeam ?? null,
       scoreBreakdown,
-    }
-  );
-
-  if (matchStateManager.haveAllPlayersActedThisRound()) {
-    const finalState = matchStateManager.getState();
-    const winnerInfo = determineWinner({
-      redRawScore: finalState.teams.red.rawScore,
-      blueRawScore: finalState.teams.blue.rawScore,
-      redFouls: finalState.teams.red.fouls,
-      blueFouls: finalState.teams.blue.fouls,
-      redDisqualified: finalState.teams.red.disqualified,
-      blueDisqualified: finalState.teams.blue.disqualified,
-    });
-
-    matchStateManager.setWinner(winnerInfo.winner, winnerInfo.reason);
-    matchStateManager.setFinishedAt(Date.now());
-    matchStateManager.setPhase("finished");
-    matchStateManager.setRequiresOvertime(winnerInfo.winner === "draw");
-    matchStateManager.resetButtonControlsForSetup();
-
-    if (winnerInfo.winner === "draw") {
-      addEventLog("MATCH_DRAW", "同点です。延長戦が必要です");
-    } else if (winnerInfo.winner === "red" || winnerInfo.winner === "blue") {
-      const winnerTeam = winnerInfo.winner;
-      addEventLog(
-        "MATCH_FINISHED",
-        `${finalState.teams[winnerTeam].name} の勝ちです`,
-        { reason: winnerInfo.reason }
-      );
-    }
-
-    broadcastState();
-    return;
-  }
-
-  const nextTurn = matchStateManager.createNextTurn();
-  matchStateManager.setCurrentTurn(nextTurn);
-  matchStateManager.setPhase("selection");
-  matchStateManager.prepareSelectionControls();
-  addEventLog(
-    "TURN_NEXT",
-    `次のターンへ進みます（ターン ${nextTurn.turnNumber}）`,
-    {
-      throwingTeam: nextTurn.throwingTeam,
-      defendingTeam: nextTurn.defendingTeam,
     }
   );
   broadcastState();
@@ -988,6 +1172,53 @@ app.post("/api/setup", (req: Request, res: Response) => {
     res.json({ success: true });
   } catch (error) {
     console.error("Error saving setup:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/draft/order", (req: Request, res: Response) => {
+  const validation = validateSetDraftOrder(req.body);
+  if (!validation.valid) {
+    res.status(400).json({ errors: validation.errors });
+    return;
+  }
+
+  const state = matchStateManager.getState();
+  if (state.phase !== "draft") {
+    res.status(400).json({ error: "Current phase is not draft" });
+    return;
+  }
+
+  const { team, playerIds } = req.body as SetDraftOrderRequest;
+  const teamPlayers = state.teams[team].players.map((player) => player.id);
+  const uniquePlayerIds = Array.from(new Set(playerIds));
+
+  if (uniquePlayerIds.length !== playerIds.length) {
+    res.status(400).json({ error: "playerIds must not contain duplicates" });
+    return;
+  }
+  if (uniquePlayerIds.some((playerId) => !teamPlayers.includes(playerId))) {
+    res.status(400).json({ error: "playerIds must belong to the specified team" });
+    return;
+  }
+  if (uniquePlayerIds.length > teamPlayers.length) {
+    res.status(400).json({ error: "playerIds is longer than the number of team players" });
+    return;
+  }
+
+  try {
+    matchStateManager.setDraftOrder(team, uniquePlayerIds);
+    matchStateManager.prepareDraftControls();
+
+    if (matchStateManager.isDraftComplete()) {
+      autoFillRemainingDraftOrderAndMaybeStart("手動設定で投球順が確定しました");
+    } else {
+      broadcastState();
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error saving draft order:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -1053,7 +1284,7 @@ app.post("/api/control/start-overtime", (req: Request, res: Response) => {
 
 app.post("/api/control/reset", (_req: Request, res: Response) => {
   try {
-    clearTurnTimeout();
+    clearPhaseTimeout();
     matchStateManager.resetToSetup();
     addEventLog("MATCH_RESET", "試合状態をリセットしました");
     broadcastState();
@@ -1062,40 +1293,6 @@ app.post("/api/control/reset", (_req: Request, res: Response) => {
     console.error("Error resetting match:", error);
     res.status(500).json({ error: "Internal server error" });
   }
-});
-
-app.post("/api/selection/shooter", (req: Request, res: Response) => {
-  const validation = validateSelectShooter(req.body);
-  if (!validation.valid) {
-    res.status(400).json({ errors: validation.errors });
-    return;
-  }
-  if (!requireSelectionPhase(res)) {
-    return;
-  }
-
-  const state = matchStateManager.getState();
-  const turn = state.currentTurn;
-  if (!turn) {
-    res.status(400).json({ error: "Current turn is missing" });
-    return;
-  }
-
-  const { playerId } = req.body as SelectShooterRequest;
-  const player = matchStateManager.getPlayer(turn.throwingTeam, playerId);
-  if (!player) {
-    res.status(400).json({ error: "Player not found in throwing team" });
-    return;
-  }
-  if (player.hasActedInRound) {
-    res.status(400).json({ error: "Selected player has already thrown in this round" });
-    return;
-  }
-
-  matchStateManager.updateCurrentSelection({ shooterId: playerId });
-  matchStateManager.prepareSelectionControls();
-  broadcastState();
-  res.json({ success: true });
 });
 
 app.post("/api/selection/distance", (req: Request, res: Response) => {
@@ -1110,41 +1307,6 @@ app.post("/api/selection/distance", (req: Request, res: Response) => {
 
   const { distanceId } = req.body as SelectDistanceRequest;
   matchStateManager.updateCurrentSelection({ distanceId });
-  matchStateManager.prepareSelectionControls();
-  broadcastState();
-  res.json({ success: true });
-});
-
-app.post("/api/selection/ball", (req: Request, res: Response) => {
-  const validation = validateSelectBall(req.body);
-  if (!validation.valid) {
-    res.status(400).json({ errors: validation.errors });
-    return;
-  }
-  if (!requireSelectionPhase(res)) {
-    return;
-  }
-
-  const { ballId } = req.body as SelectBallRequest;
-  const currentTurn = matchStateManager.getState().currentTurn;
-  if (!currentTurn) {
-    res.status(400).json({ error: "Current turn is missing" });
-    return;
-  }
-  const ball = matchStateManager.getBall(ballId);
-  if (!ball) {
-    res.status(400).json({ error: "Ball not found" });
-    return;
-  }
-  if (ball.remaining[currentTurn.defendingTeam] <= 0) {
-    res.status(400).json({ error: "Selected ball has no remaining uses" });
-    return;
-  }
-
-  matchStateManager.updateCurrentSelection({
-    ballId,
-    bonusChoice: null,
-  });
   matchStateManager.prepareSelectionControls();
   broadcastState();
   res.json({ success: true });
@@ -1179,47 +1341,14 @@ app.post("/api/selection/bonus", (req: Request, res: Response) => {
   res.json({ success: true });
 });
 
-app.post("/api/control/start-turn", (_req: Request, res: Response) => {
-  const state = matchStateManager.getState();
-  if (state.phase !== "selection") {
-    res.status(400).json({ error: "Current phase is not selection" });
-    return;
-  }
-  if (!state.currentTurn) {
-    res.status(400).json({ error: "Current turn is missing" });
-    return;
-  }
-  if (!isSelectionComplete()) {
-    res.status(400).json({ error: "Turn selection is incomplete" });
-    return;
-  }
-
-  const ballId = state.currentTurn.selection.ballId!;
-  if (!matchStateManager.consumeBall(state.currentTurn.defendingTeam, ballId)) {
-    res.status(400).json({ error: "Selected ball has no remaining uses" });
-    return;
-  }
-
+app.post("/api/control/advance", (_req: Request, res: Response) => {
   try {
-    matchStateManager.clearSensorTriggeredState();
-    matchStateManager.updateCurrentTurn({
-      startedAt: Date.now(),
-      reviewStartedAt: null,
-      sensorTriggeredAt: null,
-      outcome: null,
-      scoreBreakdown: null,
-      foulTeam: null,
-      disqualifiedTeam: null,
-      notes: null,
-    });
-    matchStateManager.setPhase("active");
-    matchStateManager.clearReviewControls();
-    addEventLog("TURN_START", `ターン ${state.currentTurn.turnNumber} を開始しました`);
+    const result = handleRefereeButton("long");
+    recordButtonOutcome("refereeControl", "long", Date.now(), result.handled, result.summary);
     broadcastState();
-    startTurnTimer();
-    res.json({ success: true });
+    res.json({ success: true, handled: result.handled, summary: result.summary });
   } catch (error) {
-    console.error("Error starting turn:", error);
+    console.error("Error advancing phase:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -1279,32 +1408,6 @@ app.post("/api/control/adjust-foul", (req: Request, res: Response) => {
   }
 });
 
-app.post("/api/control/adjust-ball", (req: Request, res: Response) => {
-  const validation = validateAdjustBall(req.body);
-  if (!validation.valid) {
-    res.status(400).json({ errors: validation.errors });
-    return;
-  }
-
-  try {
-    const { team, ballId, delta } = req.body as AdjustBallRequest;
-    const updated = matchStateManager.adjustBall(team, ballId, delta);
-    if (!updated) {
-      res.status(400).json({ error: "Ball not found" });
-      return;
-    }
-    addEventLog(
-      "BALL_ADJUSTED",
-      `${updated.name} の ${team.toUpperCase()} 利用権残数を ${delta > 0 ? "+1" : "-1"} しました`
-    );
-    broadcastState();
-    res.json({ success: true, ball: updated });
-  } catch (error) {
-    console.error("Error adjusting ball count:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
 app.post("/api/mesh/sensor", (req: Request, res: Response) => {
   const validation = validateSensorValue(req.body);
   if (!validation.valid) {
@@ -1328,11 +1431,14 @@ app.post("/api/mesh/sensor", (req: Request, res: Response) => {
       normalized <= calibration.triggerThreshold
     ) {
       matchStateManager.markSensorTriggered(eventTimestamp);
+      matchStateManager.updateCurrentTurn({
+        notes: "ゴールセンサーが成功を検知しました",
+      });
       addEventLog("GOAL_SENSOR", "ゴールセンサーが成功を検知しました", {
         raw,
         normalized,
       });
-      enterReview("ゴールセンサーが成功を検知しました", { raw, normalized });
+      broadcastState();
     }
 
     res.json({ success: true, normalized });
@@ -1358,8 +1464,18 @@ app.post("/api/mesh/button", (req: Request, res: Response) => {
   try {
     const eventTimestamp = timestamp ?? Date.now();
     const result = handleMeshButtonInput(buttonId, action, eventTimestamp);
-    recordButtonOutcome(buttonId, action, eventTimestamp, result.handled, result.summary);
-    broadcastState();
+    if (result.recordNow !== false) {
+      recordButtonOutcome(
+        buttonId,
+        result.recordedAction ?? action,
+        eventTimestamp,
+        result.handled,
+        result.summary
+      );
+    }
+    if (result.broadcastNow !== false) {
+      broadcastState();
+    }
     res.json({ success: true, handled: result.handled, summary: result.summary });
   } catch (error) {
     console.error("Error handling mesh button:", error);

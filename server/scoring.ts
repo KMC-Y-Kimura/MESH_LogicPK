@@ -1,18 +1,19 @@
 import {
   BonusChoice,
   Calibration,
-  DistanceId,
+  DistanceMeter,
   Team,
   TurnScoreBreakdown,
   Winner,
   WinnerReason,
 } from "./types";
 
-export const DISTANCE_POINTS: Record<DistanceId, number> = {
-  near: 1,
-  middle: 2,
-  far: 4,
-};
+export const DISTANCE_MIN_METER = 1;
+export const DISTANCE_MAX_METER = 15;
+export const DISTANCE_OPTIONS: DistanceMeter[] = Array.from(
+  { length: DISTANCE_MAX_METER - DISTANCE_MIN_METER + 1 },
+  (_, index) => DISTANCE_MIN_METER + index
+);
 
 export function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -39,15 +40,19 @@ export function calculateAverageBasePoints(totalBasePoints: number, playerCount:
   return totalBasePoints / playerCount;
 }
 
-export function getDistancePoints(distanceId: DistanceId): number {
-  return DISTANCE_POINTS[distanceId];
+export function isValidDistanceMeter(distance: number): distance is DistanceMeter {
+  return Number.isInteger(distance) && distance >= DISTANCE_MIN_METER && distance <= DISTANCE_MAX_METER;
+}
+
+export function getDistancePoints(distanceId: DistanceMeter): number {
+  return distanceId;
 }
 
 export function calculateSuccessBreakdown(params: {
   throwingTeam: Team;
   defendingTeam: Team;
   shooterBasePoints: number;
-  distanceId: DistanceId;
+  distanceId: DistanceMeter;
   bonusChoice: BonusChoice;
   defendingAverageBasePoints: number;
 }): TurnScoreBreakdown {

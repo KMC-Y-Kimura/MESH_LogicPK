@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { BrowserRouter as Router, Routes, Route, Navigate } from "react-router-dom";
 import OperatorPage from "./pages/OperatorPage";
 import TeamPage from "./pages/TeamPage";
-import DisplayPage from "./pages/DisplayPage";
+import PublicScorePage from "./pages/PublicScorePage";
 import { useRealtimeStore } from "./api/realtime";
 import { apiClient, useApiStore } from "./api/client";
 import { AudioCueController } from "./components/AudioCueController";
@@ -69,14 +69,15 @@ function App() {
         </div>
       )}
       <Routes>
-        <Route path="/" element={<DisplayPage />} />
+        <Route path="/" element={<Navigate to="/team/red" replace />} />
         <Route
           path="/team/red"
           element={currentState?.phase === "setup" ? <OperatorPage /> : <TeamPage team="red" />}
         />
         <Route path="/team/blue" element={<TeamPage team="blue" />} />
-        <Route path="/display" element={<Navigate to="/" replace />} />
-        <Route path="/results" element={<Navigate to="/" replace />} />
+        <Route path="/score" element={<PublicScorePage />} />
+        <Route path="/display" element={<Navigate to="/team/red" replace />} />
+        <Route path="/results" element={<Navigate to="/team/red" replace />} />
       </Routes>
     </Router>
   );

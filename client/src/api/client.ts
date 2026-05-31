@@ -5,9 +5,9 @@ import {
   EventLogEntry,
   MatchState,
   ResolveTurnRequest,
+  SetDraftOrderRequest,
   SetupMatchRequest,
   Team,
-  TurnOutcome,
 } from "../types";
 
 interface ApiClientState {
@@ -56,6 +56,14 @@ export const apiClient = {
     });
   },
 
+  setDraftOrder(payload: SetDraftOrderRequest): Promise<{ success: true }> {
+    return apiRequest("/api/draft/order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  },
+
   startMatch(firstThrowingTeam?: Team): Promise<{ success: true }> {
     return apiRequest("/api/control/start-match", {
       method: "POST",
@@ -80,27 +88,11 @@ export const apiClient = {
     });
   },
 
-  selectShooter(playerId: string): Promise<{ success: true }> {
-    return apiRequest("/api/selection/shooter", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ playerId }),
-    });
-  },
-
   selectDistance(distanceId: DistanceId): Promise<{ success: true }> {
     return apiRequest("/api/selection/distance", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ distanceId }),
-    });
-  },
-
-  selectBall(ballId: string): Promise<{ success: true }> {
-    return apiRequest("/api/selection/ball", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ballId }),
     });
   },
 
@@ -112,8 +104,8 @@ export const apiClient = {
     });
   },
 
-  startTurn(): Promise<{ success: true }> {
-    return apiRequest("/api/control/start-turn", {
+  advancePhase(): Promise<{ success: true; handled: boolean; summary: string }> {
+    return apiRequest("/api/control/advance", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
@@ -141,14 +133,6 @@ export const apiClient = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ team, delta }),
-    });
-  },
-
-  adjustBall(team: Team, ballId: string, delta: -1 | 1): Promise<{ success: true }> {
-    return apiRequest("/api/control/adjust-ball", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ team, ballId, delta }),
     });
   },
 
