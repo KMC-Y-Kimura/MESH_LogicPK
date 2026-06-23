@@ -2,6 +2,7 @@ export type Team = "red" | "blue";
 export type MatchPhase =
   | "setup"
   | "draft"
+  | "selectionReady"
   | "selection"
   | "confirmation"
   | "active"

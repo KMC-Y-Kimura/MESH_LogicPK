@@ -35,6 +35,7 @@ export const BONUS_LABELS: Record<BonusChoice, string> = {
 export const PHASE_LABELS: Record<MatchPhase, string> = {
   setup: "試合準備",
   draft: "投球順決定",
+  selectionReady: "選択開始待ち",
   selection: "ターン選択",
   confirmation: "選択確認",
   active: "投球中",

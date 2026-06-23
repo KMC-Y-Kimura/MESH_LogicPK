@@ -133,7 +133,7 @@ export default function TeamPage({ team }: TeamPageProps) {
             <div style={{ color: "#cbd5e1", lineHeight: 1.8, marginTop: "0.7rem" }}>
               <div>各チーム 5 分以内に投球順を決めます。</div>
               <div>{teamState.name} は ボタン1 で候補送り、ボタン2 で追加です。</div>
-              <div>両チームが決まり次第、最初のターン選択へ自動で進みます。</div>
+              <div>投球順が確定したら、審判長押しで最初のターン選択を開始します。</div>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1rem", marginTop: "1rem" }}>
               <OrderCard
@@ -148,6 +148,17 @@ export default function TeamPage({ team }: TeamPageProps) {
                 currentLabel="非表示"
                 players={state.teams[otherTeam(team)].throwOrderPlayerIds.map((_, index) => `P${index + 1} 確定`)}
               />
+            </div>
+          </section>
+        )}
+
+        {state.phase === "selectionReady" && currentTurn && (
+          <section style={panelStyle}>
+            <h2 style={sectionTitleStyle}>ターン選択開始待ち</h2>
+            <div style={{ color: "#cbd5e1", lineHeight: 1.8, marginTop: "0.7rem" }}>
+              <div>投球順は確定しています。</div>
+              <div>審判が長押しすると、このターンの 10 秒選択が始まります。</div>
+              <div>この段階では、まだチームボタンで選択は進みません。</div>
             </div>
           </section>
         )}

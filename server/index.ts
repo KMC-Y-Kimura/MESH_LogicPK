@@ -126,6 +126,15 @@ function cycleArrayValue<T>(values: T[], current: T | null, direction: 1 | -1): 
   return values[(currentIndex + direction + values.length) % values.length];
 }
 
+function pickRandomValue<T>(values: T[]): T | null {
+  if (values.length === 0) {
+    return null;
+  }
+
+  const index = Math.floor(Math.random() * values.length);
+  return values[index] ?? null;
+}
+
 function moveFocus<T>(values: T[], current: T, direction: 1 | -1): T {
   const currentIndex = values.indexOf(current);
   if (currentIndex < 0) {
@@ -439,46 +448,83 @@ function startNextTurnOrFinishFromResult(): void {
   );
 }
 
-function autoFillRemainingDraftOrderAndMaybeStart(message: string): void {
+function finalizeDraftAndWaitForSelectionStart(message: string): void {
+  clearPhaseTimeout();
   matchStateManager.autoCompleteDraftOrders();
-  matchStateManager.prepareDraftControls();
+  const firstTurn = matchStateManager.createInitialTurn();
+  matchStateManager.clearSensorTriggeredState();
+  matchStateManager.setCurrentTurn(firstTurn);
+  matchStateManager.prepareSelectionControls();
+  matchStateManager.setPhase("selectionReady", Date.now());
   addEventLog("DRAFT_COMPLETED", message, {
     redOrder: getDraftOrderSummary("red"),
     blueOrder: getDraftOrderSummary("blue"),
+    turnNumber: firstTurn.turnNumber,
+    throwingTeam: firstTurn.throwingTeam,
+    shooterId: firstTurn.selection.shooterId,
   });
-
-  const firstTurn = matchStateManager.createInitialTurn();
-  beginSelectionPhase(firstTurn, "投球順が確定したため、最初のターン選択へ進みます");
+  broadcastState();
 }
 
-function lockCurrentSelectionFromCandidates(): void {
+function lockCurrentSelectionFromCandidates(options?: {
+  allowRandomFallback?: boolean;
+}): { complete: boolean; usedRandomFallback: boolean } {
   const state = matchStateManager.getState();
   const turn = state.currentTurn;
   if (!turn) {
-    return;
+    return { complete: false, usedRandomFallback: false };
   }
 
   const throwingControl = state.buttonControls.team[turn.throwingTeam];
   const defendingControl = state.buttonControls.team[turn.defendingTeam];
   const availableBonusChoices = matchStateManager.getAvailableBonusChoices(turn);
+  const allowRandomFallback = options?.allowRandomFallback ?? false;
+  let usedRandomFallback = false;
+
+  const candidateDistance =
+    throwingControl.candidateDistanceId !== null && DISTANCE_ORDER.includes(throwingControl.candidateDistanceId)
+      ? throwingControl.candidateDistanceId
+      : null;
+  const candidateBonusChoice =
+    defendingControl.candidateBonusChoice !== null &&
+    availableBonusChoices.includes(defendingControl.candidateBonusChoice)
+      ? defendingControl.candidateBonusChoice
+      : null;
 
   if (!turn.selection.distanceId) {
+    const nextDistance =
+      candidateDistance ??
+      (allowRandomFallback
+        ? (() => {
+            usedRandomFallback = true;
+            return pickRandomValue(DISTANCE_ORDER);
+          })()
+        : null);
     matchStateManager.updateCurrentSelection({
-      distanceId: throwingControl.candidateDistanceId ?? DISTANCE_ORDER[0] ?? null,
+      distanceId: nextDistance,
     });
   }
 
   const refreshedTurn = matchStateManager.getState().currentTurn;
   if (refreshedTurn && !refreshedTurn.selection.bonusChoice) {
+    const nextBonusChoice =
+      candidateBonusChoice ??
+      (allowRandomFallback
+        ? (() => {
+            usedRandomFallback = true;
+            return pickRandomValue(availableBonusChoices);
+          })()
+        : null);
     matchStateManager.updateCurrentSelection({
-      bonusChoice:
-        defendingControl.candidateBonusChoice && availableBonusChoices.includes(defendingControl.candidateBonusChoice)
-          ? defendingControl.candidateBonusChoice
-          : availableBonusChoices[0] ?? null,
+      bonusChoice: nextBonusChoice,
     });
   }
 
   matchStateManager.prepareSelectionControls();
+  return {
+    complete: isSelectionComplete(),
+    usedRandomFallback,
+  };
 }
 
 function enterReview(reason: string, details?: Record<string, unknown>): void {
@@ -529,22 +575,29 @@ function handlePhaseTimeout(): void {
   const state = matchStateManager.getState();
 
   if (state.phase === "draft") {
-    autoFillRemainingDraftOrderAndMaybeStart("投球順決定の制限時間が終了したため、残りを自動確定しました");
+    finalizeDraftAndWaitForSelectionStart("投球順決定の制限時間が終了したため、残りを自動確定しました");
     return;
   }
 
   if (state.phase === "selection") {
-    lockCurrentSelectionFromCandidates();
-    if (!isSelectionComplete()) {
+    const selectionResult = lockCurrentSelectionFromCandidates({ allowRandomFallback: true });
+    if (!selectionResult.complete) {
       addEventLog("TURN_SELECTION_TIMEOUT", "選択時間が終了しましたが、選択を確定できませんでした");
       broadcastState();
       return;
     }
     matchStateManager.setPhase("confirmation", null);
     matchStateManager.updateCurrentTurn({
-      notes: "選択時間終了のため、自動で確認画面へ進みました",
+      notes: selectionResult.usedRandomFallback
+        ? "選択時間終了のため、自動補完して確認画面へ進みました"
+        : "選択時間終了のため、自動で確認画面へ進みました",
     });
-    addEventLog("TURN_SELECTION_TIMEOUT", "選択時間が終了したため、確認画面へ進みました");
+    addEventLog(
+      "TURN_SELECTION_TIMEOUT",
+      selectionResult.usedRandomFallback
+        ? "選択時間が終了したため、不足項目を自動補完して確認画面へ進みました"
+        : "選択時間が終了したため、確認画面へ進みました"
+    );
     broadcastState();
     return;
   }
@@ -599,8 +652,8 @@ function handleOrderTeamButton(
 
   const playerName = matchStateManager.getPlayer(team, candidatePlayerId)?.name ?? "不明";
   if (matchStateManager.isDraftComplete()) {
-    autoFillRemainingDraftOrderAndMaybeStart("両チームの投球順が確定しました");
-    return { handled: true, summary: `${playerName} を追加し、投球順決定を完了しました` };
+    finalizeDraftAndWaitForSelectionStart("両チームの投球順が確定しました");
+    return { handled: true, summary: `${playerName} を追加し、審判の合図待ちに入りました` };
   }
 
   broadcastState();
@@ -708,8 +761,22 @@ function handleDraftRefereeButton(action: KnownButtonAction): { handled: boolean
     return { handled: false, summary: "投球順決定中は長押しで残りを確定して次へ進みます" };
   }
 
-  autoFillRemainingDraftOrderAndMaybeStart("審判が投球順決定を終了しました");
-  return { handled: true, summary: "投球順を確定して、最初のターン選択へ進みました" };
+  finalizeDraftAndWaitForSelectionStart("審判が投球順決定を終了しました");
+  return { handled: true, summary: "投球順を確定し、ターン選択の開始待ちに入りました" };
+}
+
+function handleSelectionReadyRefereeButton(action: KnownButtonAction): { handled: boolean; summary: string } {
+  if (action !== "long") {
+    return { handled: false, summary: "選択開始待ちでは長押しでターン選択を始めます" };
+  }
+
+  const currentTurn = matchStateManager.getState().currentTurn;
+  if (!currentTurn) {
+    return { handled: false, summary: "開始するターンがありません" };
+  }
+
+  beginSelectionPhase(currentTurn, "審判の合図でターン選択を開始します");
+  return { handled: true, summary: "ターン選択を開始しました" };
 }
 
 function handleSelectionRefereeButton(action: KnownButtonAction): { handled: boolean; summary: string } {
@@ -717,8 +784,8 @@ function handleSelectionRefereeButton(action: KnownButtonAction): { handled: boo
     return { handled: false, summary: "選択フェーズでは長押しで確認画面へ進みます" };
   }
 
-  lockCurrentSelectionFromCandidates();
-  if (!isSelectionComplete()) {
+  const selectionResult = lockCurrentSelectionFromCandidates();
+  if (!selectionResult.complete) {
     return { handled: false, summary: "選択が未完了のため確認へ進めません" };
   }
 
@@ -921,6 +988,10 @@ function handleRefereeButton(action: KnownButtonAction): { handled: boolean; sum
 
   if (phase === "draft") {
     return handleDraftRefereeButton(action);
+  }
+
+  if (phase === "selectionReady") {
+    return handleSelectionReadyRefereeButton(action);
   }
 
   if (phase === "selection") {
@@ -1211,7 +1282,7 @@ app.post("/api/draft/order", (req: Request, res: Response) => {
     matchStateManager.prepareDraftControls();
 
     if (matchStateManager.isDraftComplete()) {
-      autoFillRemainingDraftOrderAndMaybeStart("手動設定で投球順が確定しました");
+      finalizeDraftAndWaitForSelectionStart("手動設定で投球順が確定しました");
     } else {
       broadcastState();
     }
