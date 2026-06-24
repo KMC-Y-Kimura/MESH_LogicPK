@@ -1,4 +1,4 @@
-# MESH_MAIN
+# MESH_MAI
 
 MESH ブロックを BLE 直結で使う、Logic PK 用の競技進行・判定システムです。  
 MESH アプリは必須ではありません。RED 画面、BLUE 画面、スマホ用スコア画面の 3 系統で運用します。
